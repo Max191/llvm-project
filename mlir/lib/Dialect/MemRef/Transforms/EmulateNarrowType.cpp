@@ -318,7 +318,8 @@ struct ConvertMemrefStore final : OpConversionPattern<memref::StoreOp> {
       Value shiftVal = rewriter.create<arith::ConstantOp>(loc, dstIntegerType, shiftValAttr).getResult();
       Value alignedVal = rewriter.create<arith::ShLIOp>(loc, extendedInput, shiftVal).getResult();
       // Create mask to clear destination bits
-      auto writeMaskValAttr = rewriter.getIntegerAttr(dstIntegerType, 1 << (dstBits - srcBits) - 1);
+      auto writeMaskValAttr = rewriter.getIntegerAttr(
+          dstIntegerType, (1 << (dstBits - srcBits)) - 1);
       Value writeMask = rewriter.create<arith::ConstantOp>(loc, dstIntegerType, writeMaskValAttr).getResult();
 
       // Clear destination bits
