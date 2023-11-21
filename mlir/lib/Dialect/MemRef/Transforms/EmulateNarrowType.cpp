@@ -36,19 +36,15 @@ using namespace mlir;
 /// Return the bit offset of the value at position `srcIdx`. For example, if
 /// `sourceBits` equals to 4 and `targetBits` equals to 8, the x-th element is
 /// located at (x % 2) * 4. Because there are two elements in one i8, and one
-/// element has 4 bits. If `rightOffset` is true, return the offset from the
-/// right side of the `dstBits` container instead of the left side.
+/// element has 4 bits.
 static Value getOffsetForBitwidth(Location loc, OpFoldResult srcIdx,
                                   int sourceBits, int targetBits,
-                                  OpBuilder &builder,
-                                  bool rightOffset = false) {
+                                  OpBuilder &builder) {
   assert(targetBits % sourceBits == 0);
   AffineExpr s0;
   bindSymbols(builder.getContext(), s0);
   int scaleFactor = targetBits / sourceBits;
-  AffineExpr offsetExpr =
-      rightOffset ? (scaleFactor - 1 - s0 % scaleFactor) * sourceBits
-                  : (s0 % scaleFactor) * sourceBits;
+  AffineExpr offsetExpr = (s0 % scaleFactor) * sourceBits;
   OpFoldResult offsetVal =
       affine::makeComposedFoldedAffineApply(builder, loc, offsetExpr, {srcIdx});
   Value bitOffset = getValueOrCreateConstantIndexOp(builder, loc, offsetVal);
@@ -345,18 +341,9 @@ struct ConvertMemrefStore final : OpConversionPattern<memref::StoreOp> {
     // Special case 0-rank memref stores. We can compute the mask at compile
     // time.
     if (convertedType.getRank() == 0) {
-      // Shift extended value to be left aligned
-      auto shiftValAttr =
-          rewriter.getIntegerAttr(dstIntegerType, dstBits - srcBits);
-      Value shiftVal =
-          rewriter.create<arith::ConstantOp>(loc, dstIntegerType, shiftValAttr)
-              .getResult();
-      Value alignedVal =
-          rewriter.create<arith::ShLIOp>(loc, extendedInput, shiftVal)
-              .getResult();
       // Create mask to clear destination bits
-      auto writeMaskValAttr = rewriter.getIntegerAttr(
-          dstIntegerType, (1 << (dstBits - srcBits)) - 1);
+      auto writeMaskValAttr =
+          rewriter.getIntegerAttr(dstIntegerType, ~(1 << (srcBits)) - 1);
       Value writeMask =
           rewriter
               .create<arith::ConstantOp>(loc, dstIntegerType, writeMaskValAttr)
@@ -368,7 +355,7 @@ struct ConvertMemrefStore final : OpConversionPattern<memref::StoreOp> {
                                            ValueRange{});
       // Write srcs bits to destination
       rewriter.create<memref::AtomicRMWOp>(loc, arith::AtomicRMWKind::ori,
-                                           alignedVal, adaptor.getMemref(),
+                                           extendedInput, adaptor.getMemref(),
                                            ValueRange{});
       rewriter.eraseOp(op);
       return success();
@@ -379,7 +366,7 @@ struct ConvertMemrefStore final : OpConversionPattern<memref::StoreOp> {
     Value storeIndices = getIndicesForLoadOrStore(
         rewriter, loc, linearizedIndices, srcBits, dstBits);
     Value bitwidthOffset = getOffsetForBitwidth(loc, linearizedIndices, srcBits,
-                                                dstBits, rewriter, true);
+                                                dstBits, rewriter);
     Value writeMask = getAtomicWriteMask(loc, linearizedIndices, srcBits,
                                          dstBits, bitwidthOffset, rewriter);
     // Align the value to write with the destination bits
