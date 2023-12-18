@@ -924,6 +924,17 @@ void SelectionDAGLegalize::LegalizeLoadOps(SDNode *Node) {
           Chain = Result.getValue(1);
           break;
         }
+        if (SrcVT.getScalarType() == MVT::bf16) {
+          EVT ISrcVT = SrcVT.changeTypeToInteger();
+          EVT IDestVT = DestVT.changeTypeToInteger();
+          EVT ILoadVT = TLI.getRegisterType(IDestVT.getSimpleVT());
+
+          SDValue Result = DAG.getExtLoad(ISD::ZEXTLOAD, dl, ILoadVT, Chain,
+                                          Ptr, ISrcVT, LD->getMemOperand());
+          Value = DAG.getNode(ISD::BF16_TO_FP, dl, DestVT, Result);
+          Chain = Result.getValue(1);
+          break;
+        }
       }
 
       assert(!SrcVT.isVector() &&
