@@ -48,6 +48,34 @@ static LogicalResult isPackOn1D(RewriterBase &rewriter, Operation *op,
   return success();
 }
 
+// If the `linalgOp` represents a transpose, return the permutation vector for
+// the transpose. Otherwise, return failure.
+static FailureOr<SmallVector<int64_t>>
+getTransposeOpPermutation(linalg::LinalgOp linalgOp) {
+  if (auto transposeOp = dyn_cast<linalg::TransposeOp>(linalgOp.getOperation()))
+    return SmallVector<int64_t>(transposeOp.getPermutation());
+  if (linalgOp.getNumParallelLoops() != linalgOp.getNumLoops())
+    return failure();
+
+  if (linalgOp.getNumDpsInputs() != 1 || linalgOp.getNumDpsInits() != 1)
+    return failure();
+  auto mapRange = linalgOp.getIndexingMapsArray();
+  if (mapRange.size() != 2 || !mapRange.front().isPermutation() ||
+      !mapRange.back().isPermutation() || mapRange.front() == mapRange.back()) {
+    return failure();
+  }
+  if (!llvm::hasSingleElement(linalgOp.getBlock()->getOperations()))
+    return failure();
+  AffineMap outMap = mapRange.back();
+  AffineMap inMap = mapRange.front();
+  // To get the permutation, look at each output index and find which
+  // dimension in the input we're reading from for that index.
+  return llvm::map_to_vector(outMap.getResults(),
+                             [&](AffineExpr expr) -> int64_t {
+                               return *inMap.getResultPosition(expr);
+                             });
+}
+
 /// Packing one-dimensional tensor can be expressed as an expand shape op.
 struct SimplifyPackToExpandShape : public OpRewritePattern<PackOp> {
   using OpRewritePattern<PackOp>::OpRewritePattern;
@@ -244,14 +272,10 @@ static bool checkAndPermute(ArrayRef<int64_t> permutation,
 
   for (unsigned int i = 0; i < rank; ++i) {
     int64_t remappedPosition = permutation[i];
-
-    if (!inVec.empty()) {
-      if (remappedPosition >= rank) {
-        return false;
-      }
+    if (remappedPosition >= rank)
+      return false;
+    if (!inVec.empty())
       remappedPosition = inVec[remappedPosition];
-    }
-
     resVec.push_back(remappedPosition);
   }
 
@@ -261,20 +285,26 @@ static bool checkAndPermute(ArrayRef<int64_t> permutation,
 /// Fold 'pack' -> 'transpose' into 'pack' since 'pack' already has transpose
 /// semantics.
 struct FoldProducerPackWithConsumerLinalgTransposeOp
-    : public OpRewritePattern<linalg::TransposeOp> {
-  using OpRewritePattern<linalg::TransposeOp>::OpRewritePattern;
+    : public OpInterfaceRewritePattern<linalg::LinalgOp> {
+  using OpInterfaceRewritePattern<linalg::LinalgOp>::OpInterfaceRewritePattern;
 
-  LogicalResult matchAndRewrite(linalg::TransposeOp transposeOp,
+  LogicalResult matchAndRewrite(linalg::LinalgOp linalgOp,
                                 PatternRewriter &rewriter) const override {
-    auto packOp = transposeOp.getOperand(0).getDefiningOp<PackOp>();
+    auto packOp = linalgOp->getOperand(0).getDefiningOp<PackOp>();
 
     if (!packOp)
       return failure();
 
+    FailureOr<SmallVector<int64_t>> maybePerm =
+        getTransposeOpPermutation(linalgOp);
+    if (failed(maybePerm)) {
+      return failure();
+    }
+
     auto innerDimsPos = packOp.getInnerDimsPos();
     auto mixedInnerTiles = packOp.getMixedTiles();
     auto outerDimsPerm = packOp.getOuterDimsPerm();
-    auto transposePerm = transposeOp.getPermutation();
+    auto transposePerm = maybePerm.value();
     SmallVector<int64_t> newOuterDimsPermVec;
     SmallVector<int64_t> newInnerDimsPosVec;
     SmallVector<OpFoldResult> newMixedInnerTilesVec;
@@ -283,7 +313,7 @@ struct FoldProducerPackWithConsumerLinalgTransposeOp
     if (!checkAndPermute(transposePerm, outerDimsPerm, newOuterDimsPermVec,
                          srcRank))
       return rewriter.notifyMatchFailure(
-          transposeOp,
+          linalgOp,
           "Cannot fold in tensor.pack if a tile dimension was transposed "
           "with a non-tile dimension in linalg.transpose.");
 
@@ -295,11 +325,11 @@ struct FoldProducerPackWithConsumerLinalgTransposeOp
     }
 
     Value output = packOp.createDestinationTensor(
-        rewriter, transposeOp.getLoc(), packOp.getSource(),
-        newMixedInnerTilesVec, newInnerDimsPosVec, newOuterDimsPermVec);
+        rewriter, linalgOp.getLoc(), packOp.getSource(), newMixedInnerTilesVec,
+        newInnerDimsPosVec, newOuterDimsPermVec);
 
     rewriter.replaceOpWithNewOp<PackOp>(
-        transposeOp, packOp.getSource(), output, newInnerDimsPosVec,
+        linalgOp, packOp.getSource(), output, newInnerDimsPosVec,
         newMixedInnerTilesVec, packOp.getPaddingValue(), newOuterDimsPermVec);
 
     return success();
@@ -314,12 +344,17 @@ struct FoldConsumerPackWithProducerLinalgTransposeOp
 
   LogicalResult matchAndRewrite(PackOp packOp,
                                 PatternRewriter &rewriter) const override {
-    auto transposeOp = packOp.getSource().getDefiningOp<linalg::TransposeOp>();
-
-    if (!transposeOp)
+    auto linalgOp = packOp.getSource().getDefiningOp<linalg::LinalgOp>();
+    if (!linalgOp)
       return failure();
 
-    auto transposePermutation = transposeOp.getPermutation();
+    FailureOr<SmallVector<int64_t>> maybePerm =
+        getTransposeOpPermutation(linalgOp);
+    if (failed(maybePerm)) {
+      return failure();
+    }
+
+    auto transposePermutation = maybePerm.value();
     auto outerDimsPerm = packOp.getOuterDimsPerm();
     auto innerDimsPos = packOp.getInnerDimsPos();
     SmallVector<int64_t> newInnerDimsPosVec;
@@ -335,11 +370,11 @@ struct FoldConsumerPackWithProducerLinalgTransposeOp
       newInnerDimsPosVec.push_back(transposePermutation[dim]);
 
     Value output = packOp.createDestinationTensor(
-        rewriter, packOp.getLoc(), transposeOp.getOperand(0),
+        rewriter, packOp.getLoc(), linalgOp->getOperand(0),
         packOp.getMixedTiles(), newInnerDimsPosVec, newOuterDimsPermVec);
 
     rewriter.replaceOpWithNewOp<PackOp>(
-        packOp, transposeOp.getOperand(0), output, newInnerDimsPosVec,
+        packOp, linalgOp->getOperand(0), output, newInnerDimsPosVec,
         packOp.getMixedTiles(), packOp.getPaddingValue(), newOuterDimsPermVec);
 
     return success();
@@ -349,22 +384,29 @@ struct FoldConsumerPackWithProducerLinalgTransposeOp
 /// Fold 'unpack' -> 'transpose' into 'unpack' since 'unpack' already has
 /// transpose semantics.
 struct FoldProducerUnPackWithConsumerLinalgTransposeOp
-    : public OpRewritePattern<linalg::TransposeOp> {
-  using OpRewritePattern<linalg::TransposeOp>::OpRewritePattern;
+    : public OpInterfaceRewritePattern<linalg::LinalgOp> {
+  using OpInterfaceRewritePattern<linalg::LinalgOp>::OpInterfaceRewritePattern;
 
-  LogicalResult matchAndRewrite(linalg::TransposeOp transposeOp,
+  LogicalResult matchAndRewrite(linalg::LinalgOp linalgOp,
                                 PatternRewriter &rewriter) const override {
-    auto unPackOp = transposeOp.getOperand(0).getDefiningOp<UnPackOp>();
+    auto unPackOp = linalgOp->getOperand(0).getDefiningOp<UnPackOp>();
 
     if (!unPackOp)
       return failure();
 
-    auto transposePermutation = transposeOp.getPermutation();
+    FailureOr<SmallVector<int64_t>> maybePerm =
+        getTransposeOpPermutation(linalgOp);
+    if (failed(maybePerm)) {
+      return failure();
+    }
+
+    auto transposePermutation = maybePerm.value();
+    SmallVector<int64_t> inverseTransposePerm =
+        invertPermutationVector(transposePermutation);
     auto outerDimsPerm = unPackOp.getOuterDimsPerm();
     auto innerDimsPos = unPackOp.getInnerDimsPos();
     SmallVector<int64_t> newInnerDimsPosVec;
-    SmallVector<int64_t> newOuterDimsPermVec =
-        llvm::to_vector(transposePermutation);
+    SmallVector<int64_t> newOuterDimsPermVec = inverseTransposePerm;
 
     if (!outerDimsPerm.empty())
       applyPermutationToVector(newOuterDimsPermVec, outerDimsPerm);
@@ -372,11 +414,11 @@ struct FoldProducerUnPackWithConsumerLinalgTransposeOp
     // Can't use applyPermutationToVector for newInnerDimsPosVec since input and
     // permutation rank won't necessarily be equal in all cases.
     for (auto dim : innerDimsPos)
-      newInnerDimsPosVec.push_back(transposePermutation[dim]);
+      newInnerDimsPosVec.push_back(inverseTransposePerm[dim]);
 
     // Reuse the destination of the transpose op.
     rewriter.replaceOpWithNewOp<UnPackOp>(
-        transposeOp, unPackOp.getSource(), transposeOp.getDpsInits()[0],
+        linalgOp, unPackOp.getSource(), linalgOp.getDpsInits()[0],
         newInnerDimsPosVec, unPackOp.getMixedTiles(), newOuterDimsPermVec);
 
     return success();
@@ -391,13 +433,19 @@ struct FoldConsumerUnPackWithProducerLinalgTransposeOp
 
   LogicalResult matchAndRewrite(UnPackOp unPackOp,
                                 PatternRewriter &rewriter) const override {
-    auto transposeOp =
-        unPackOp.getSource().getDefiningOp<linalg::TransposeOp>();
-
-    if (!transposeOp)
+    auto linalgOp = unPackOp.getSource().getDefiningOp<linalg::LinalgOp>();
+    if (!linalgOp)
       return failure();
 
-    auto transposePermutation = transposeOp.getPermutation();
+    FailureOr<SmallVector<int64_t>> maybePerm =
+        getTransposeOpPermutation(linalgOp);
+    if (failed(maybePerm)) {
+      return failure();
+    }
+
+    auto transposePermutation = maybePerm.value();
+    SmallVector<int64_t> inverseTransposePerm =
+        invertPermutationVector(transposePermutation);
     auto outerDimsPerm = unPackOp.getOuterDimsPerm();
     auto innerDimsPos = unPackOp.getInnerDimsPos();
     int64_t destRank = unPackOp.getSourceRank() - innerDimsPos.size();
@@ -406,7 +454,7 @@ struct FoldConsumerUnPackWithProducerLinalgTransposeOp
     SmallVector<int64_t> newInnerDimsPosVec;
     SmallVector<OpFoldResult> newMixedInnerTilesVec;
 
-    if (!checkAndPermute(transposePermutation, outerDimsPerm,
+    if (!checkAndPermute(inverseTransposePerm, outerDimsPerm,
                          newOuterDimsPermVec, destRank))
       return rewriter.notifyMatchFailure(
           unPackOp,
@@ -414,18 +462,18 @@ struct FoldConsumerUnPackWithProducerLinalgTransposeOp
           "with a non-tile dimension in linalg.transpose.");
 
     // Process transpose operation for tiled inner dimensions
-    for (unsigned int i = destRank; i < transposePermutation.size(); ++i) {
-      int64_t remappedPosition = transposePermutation[i] - destRank;
+    for (unsigned int i = destRank; i < inverseTransposePerm.size(); ++i) {
+      int64_t remappedPosition = inverseTransposePerm[i] - destRank;
       newMixedInnerTilesVec.push_back(mixedInnerTilesVec[remappedPosition]);
       newInnerDimsPosVec.push_back(innerDimsPos[remappedPosition]);
     }
 
     Value output = unPackOp.createDestinationTensor(
-        rewriter, unPackOp.getLoc(), transposeOp.getOperand(0),
+        rewriter, unPackOp.getLoc(), linalgOp->getOperand(0),
         newMixedInnerTilesVec, newInnerDimsPosVec, newOuterDimsPermVec);
 
     rewriter.replaceOpWithNewOp<UnPackOp>(
-        unPackOp, transposeOp.getOperand(0), output, newInnerDimsPosVec,
+        unPackOp, linalgOp->getOperand(0), output, newInnerDimsPosVec,
         newMixedInnerTilesVec, newOuterDimsPermVec);
 
     return success();
