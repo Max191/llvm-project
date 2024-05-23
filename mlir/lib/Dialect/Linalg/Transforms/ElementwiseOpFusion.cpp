@@ -17,12 +17,17 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/SparseTensor/IR/SparseTensor.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineMap.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/STLExtras.h"
 #include <optional>
 #include <utility>
 
@@ -1023,6 +1028,74 @@ struct FoldReshapeWithGenericOpByExpansion
 private:
   ControlFusionFn controlFoldingReshapes;
 };
+
+/// Pattern to bubble up a tensor.expand_shape op through a producer
+/// tensor.collapse_shape op that has non intersecting reassociations.
+struct BubbleUpExpandThroughParallelCollapse
+    : public OpRewritePattern<tensor::ExpandShapeOp> {
+  using OpRewritePattern<tensor::ExpandShapeOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tensor::ExpandShapeOp expandOp,
+                                PatternRewriter &rewriter) const override {
+    auto collapseOp =
+        expandOp.getSrc().getDefiningOp<tensor::CollapseShapeOp>();
+    if (!collapseOp) {
+      return failure();
+    }
+    if (!collapseOp->hasOneUse()) {
+      return failure();
+    }
+    auto expandReInds = expandOp.getReassociationIndices();
+    auto collapseReInds = collapseOp.getReassociationIndices();
+    for (auto [expandReassociation, collapseReassociation] :
+         llvm::zip_equal(expandReInds, collapseReInds)) {
+      if (collapseReassociation.size() != 1 && expandReassociation.size() != 1)
+        return failure();
+    }
+
+    SmallVector<ReassociationIndices> newExpandReInds, newCollapseReInds;
+    Location loc = expandOp->getLoc();
+    SmallVector<OpFoldResult> collapseSizes =
+        tensor::getMixedSizes(rewriter, loc, collapseOp.getSrc());
+    SmallVector<OpFoldResult> expandSizes(getMixedValues(
+        expandOp.getStaticOutputShape(), expandOp.getOutputShape(), rewriter));
+    SmallVector<OpFoldResult> newExpandSizes;
+    int64_t index = 0, expandIndex = 0, collapseIndex = 0;
+    for (auto [idx, collapseReassociation] : llvm::enumerate(collapseReInds)) {
+      if (collapseReassociation.size() != 1) {
+        ReassociationIndices newCollapseReassociation;
+        for (int64_t i = 0; i < collapseReassociation.size(); ++i) {
+          newCollapseReassociation.push_back(index);
+          newExpandReInds.push_back({index++});
+          newExpandSizes.push_back(collapseSizes[collapseIndex++]);
+        }
+        newCollapseReInds.push_back(newCollapseReassociation);
+        expandIndex++;
+        continue;
+      }
+      ReassociationIndices newExpandReassociation;
+      auto expandReassociation = expandReInds[idx];
+      for (int64_t i = 0; i < expandReassociation.size(); ++i) {
+        newExpandReassociation.push_back(index);
+        newCollapseReInds.push_back({index++});
+        newExpandSizes.push_back(expandSizes[expandIndex++]);
+      }
+      newExpandReInds.push_back(newExpandReassociation);
+      collapseIndex++;
+    }
+    SmallVector<Value> dynamicSizes;
+    SmallVector<int64_t> staticSizes;
+    dispatchIndexOpFoldResults(newExpandSizes, dynamicSizes, staticSizes);
+    auto expandResultType = expandOp.getResultType().clone(staticSizes);
+    auto newExpand = rewriter.create<tensor::ExpandShapeOp>(
+        loc, expandResultType, collapseOp.getSrc(), newExpandReInds,
+        newExpandSizes);
+    rewriter.replaceOpWithNewOp<tensor::CollapseShapeOp>(
+        expandOp, newExpand.getResult(), newCollapseReInds);
+    return success();
+  }
+};
+
 } // namespace
 
 //===---------------------------------------------------------------------===//
@@ -1939,6 +2012,7 @@ void mlir::linalg::populateFoldReshapeOpsByExpansionPatterns(
                                                     controlFoldingReshapes);
   patterns.add<FoldWithProducerReshapeOpByExpansion>(patterns.getContext(),
                                                      controlFoldingReshapes);
+  patterns.add<BubbleUpExpandThroughParallelCollapse>(patterns.getContext());
 }
 
 void mlir::linalg::populateFoldReshapeOpsByCollapsingPatterns(
