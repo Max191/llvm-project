@@ -629,6 +629,14 @@ FailureOr<TilingResult> tensor::bubbleUpPadSlice(OpBuilder &b,
     auto length = sizes[dim];
     auto srcSize = tensor::getMixedSize(b, loc, padOp.getSource(), dim);
 
+    if (!hasHighPad && !hasLowPad) {
+      newLows.push_back(low);
+      newOffsets.push_back(offset);
+      newLengths.push_back(length);
+      newHighs.push_back(high);
+      newStrides.push_back(b.getIndexAttr(1));
+      continue;
+    }
     // The new amount of low padding is `low - offset`. Except for the case
     // where none of the low padding is read. In that case, the new amount of
     // low padding is zero.
