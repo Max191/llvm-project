@@ -19,6 +19,7 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tensor/Transforms/SubsetInsertionOpInterfaceImpl.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
+#include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/Operation.h"
 
@@ -931,7 +932,45 @@ struct ParallelInsertSliceOpInterface
 
   bool bufferizesToMemoryRead(Operation *op, OpOperand &opOperand,
                               const AnalysisState &state) const {
-    return true;
+    auto parallelInsertSliceOp = cast<tensor::ParallelInsertSliceOp>(op);
+
+    // The source is always read.
+    if (opOperand == parallelInsertSliceOp.getSourceMutable())
+      return true;
+
+    // For the destination, no read is required if the destination is fully
+    // overwritten.
+    assert(opOperand == parallelInsertSliceOp.getDestMutable() &&
+           "expected dest");
+
+    // Compute the trip count of the parent scf::ForallOp
+    auto forallOp = llvm::dyn_cast<scf::ForallOp>(
+        parallelInsertSliceOp.getParallelCombiningParent()->getParentOp());
+    if (!forallOp)
+      return true;
+    int flatTripCount = 1;
+    for (auto [lb, ub, step] : llvm::zip_equal(forallOp.getMixedLowerBound(),
+                                               forallOp.getMixedUpperBound(),
+                                               forallOp.getMixedStep())) {
+      std::optional<int64_t> tripCount = constantTripCount(lb, ub, step);
+      if (!tripCount.has_value())
+        return true;
+      flatTripCount *= tripCount.value();
+    }
+
+    // It is undefined behavior to have overlapping or out of bounds
+    // parallel_insert_slice ops, so checking that the product of the source
+    // dimensions and the loop bounds is equal to the product of the destination
+    // tensor is enough to know that no read is required on the destination.
+    std::optional<SmallVector<int64_t>> constSizes =
+        getConstantIntValues(parallelInsertSliceOp.getMixedSizes());
+    if (!constSizes)
+      return true;
+    RankedTensorType destType = parallelInsertSliceOp.getDestType();
+    if (!destType.hasStaticShape())
+      return true;
+    return ShapedType::getNumElements(constSizes.value()) * flatTripCount !=
+           destType.getNumElements();
   }
 
   bool bufferizesToMemoryWrite(Operation *op, OpOperand &opOperand,
