@@ -3124,33 +3124,16 @@ FailureOr<Value> SubViewOp::rankReduceIfNeeded(OpBuilder &b, Location loc,
   return createCanonicalRankReducingSubViewOp(b, loc, value, desiredShape);
 }
 
-/// Helper method to check if a `subview` operation is trivially a no-op. This
-/// is the case if the all offsets are zero, all strides are 1, and the source
-/// shape is same as the size of the subview. In such cases, the subview can
-/// be folded into its source.
+/// Helper method to check if a `subview` operation is trivially a no-op. Since
+/// out of bounds subviews are undefined behaviour, this is the case if the
+/// source shape is same as the size of the subview. In such cases, the subview
+/// can be folded into its source.
 static bool isTrivialSubViewOp(SubViewOp subViewOp) {
   if (subViewOp.getSourceType().getRank() != subViewOp.getType().getRank())
     return false;
 
-  auto mixedOffsets = subViewOp.getMixedOffsets();
-  auto mixedSizes = subViewOp.getMixedSizes();
-  auto mixedStrides = subViewOp.getMixedStrides();
-
-  // Check offsets are zero.
-  if (llvm::any_of(mixedOffsets, [](OpFoldResult ofr) {
-        std::optional<int64_t> intValue = getConstantIntValue(ofr);
-        return !intValue || intValue.value() != 0;
-      }))
-    return false;
-
-  // Check strides are one.
-  if (llvm::any_of(mixedStrides, [](OpFoldResult ofr) {
-        std::optional<int64_t> intValue = getConstantIntValue(ofr);
-        return !intValue || intValue.value() != 1;
-      }))
-    return false;
-
   // Check all size values are static and matches the (static) source shape.
+  auto mixedSizes = subViewOp.getMixedSizes();
   ArrayRef<int64_t> sourceShape = subViewOp.getSourceType().getShape();
   for (const auto &size : llvm::enumerate(mixedSizes)) {
     std::optional<int64_t> intValue = getConstantIntValue(size.value());
