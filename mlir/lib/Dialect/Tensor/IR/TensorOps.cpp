@@ -4679,6 +4679,24 @@ LogicalResult UnPackOp::canonicalize(UnPackOp unPackOp,
     return success();
   }
 
+  // Replace any constant Value inner tiles with index attrs.
+  SmallVector<OpFoldResult> newMixedTiles(unPackOp.getMixedTiles());
+  bool foundConstTile = false;
+  for (OpFoldResult &innerTile : newMixedTiles) {
+    std::optional<int64_t> constTile = getConstantIntValue(innerTile);
+    if (!isa<Value>(innerTile) || !constTile.has_value()) {
+      continue;
+    }
+    foundConstTile = true;
+    innerTile = rewriter.getIndexAttr(*constTile);
+  }
+  if (foundConstTile) {
+    rewriter.replaceOpWithNewOp<tensor::UnPackOp>(
+        unPackOp, unPackOp.getSource(), unPackOp.getDest(),
+        unPackOp.getInnerDimsPos(), newMixedTiles, unPackOp.getOuterDimsPerm());
+    return success();
+  }
+
   return failure();
 }
 
