@@ -49,6 +49,64 @@ struct AffineApplyOpInterface
   }
 };
 
+struct AffineDelinearizeIndexOpInterface
+    : public ValueBoundsOpInterface::ExternalModel<
+          AffineDelinearizeIndexOpInterface, AffineDelinearizeIndexOp> {
+  void populateBoundsForIndexValue(Operation *op, Value value,
+                                   ValueBoundsConstraintSet &cstr) const {
+    auto delinearizeOp = cast<AffineDelinearizeIndexOp>(op);
+    auto result = cast<OpResult>(value);
+    int64_t resultIdx = result.getResultNumber();
+    assert(result.getOwner() == delinearizeOp && "invalid value");
+
+    AffineExpr linearIdxExpr = cstr.getExpr(delinearizeOp.getLinearIndex());
+    SmallVector<OpFoldResult> basis = delinearizeOp.getMixedBasis();
+    SmallVector<AffineExpr> basisExprs;
+    AffineExpr modExpr = getAffineConstantExpr(1, op->getContext());
+    AffineExpr strideExpr = getAffineConstantExpr(1, op->getContext());
+    for (int i = basis.size() - 1; i >= resultIdx; --i) {
+      AffineExpr basisExpr = cstr.getExpr(basis[i]);
+      modExpr = modExpr * basisExpr;
+      if (i > resultIdx)
+        strideExpr = strideExpr * basisExpr;
+    }
+    AffineExpr bound = linearIdxExpr;
+    if (resultIdx > 0)
+      bound = bound % modExpr;
+    if (resultIdx < delinearizeOp->getNumResults())
+      bound = bound.floorDiv(strideExpr);
+
+    cstr.bound(value) == bound;
+  }
+};
+
+struct AffineLinearizeIndexOpInterface
+    : public ValueBoundsOpInterface::ExternalModel<
+          AffineLinearizeIndexOpInterface, AffineLinearizeIndexOp> {
+  void populateBoundsForIndexValue(Operation *op, Value value,
+                                   ValueBoundsConstraintSet &cstr) const {
+    auto linearizeOp = cast<AffineLinearizeIndexOp>(op);
+    assert(value == linearizeOp.getResult() && "invalid value");
+
+    SmallVector<OpFoldResult> basis = linearizeOp.getMixedBasis();
+    SmallVector<AffineExpr> basisExprs = llvm::map_to_vector(
+        basis, [&](OpFoldResult ofr) { return cstr.getExpr(ofr); });
+    SmallVector<OpFoldResult> indices(linearizeOp.getMultiIndex());
+    SmallVector<AffineExpr> indexExprs = llvm::map_to_vector(
+        indices, [&](OpFoldResult ofr) { return cstr.getExpr(ofr); });
+    AffineExpr linearIdxExpr = indexExprs.back();
+    AffineExpr strideExpr = basisExprs.back();
+    for (int i = 0; i < indexExprs.size() - 1; --i) {
+      int64_t indexExprsIdx = indexExprs.size() - 2 - i;
+      int64_t basisExprsIdx = basisExprs.size() - 2 - i;
+      linearIdxExpr = linearIdxExpr + indexExprs[indexExprsIdx] * strideExpr;
+      strideExpr = strideExpr * basisExprs[basisExprsIdx];
+    }
+
+    cstr.bound(value) == linearIdxExpr;
+  }
+};
+
 struct AffineMinOpInterface
     : public ValueBoundsOpInterface::ExternalModel<AffineMinOpInterface,
                                                    AffineMinOp> {
@@ -140,6 +198,10 @@ void mlir::affine::registerValueBoundsOpInterfaceExternalModels(
     DialectRegistry &registry) {
   registry.addExtension(+[](MLIRContext *ctx, AffineDialect *dialect) {
     AffineApplyOp::attachInterface<AffineApplyOpInterface>(*ctx);
+    AffineDelinearizeIndexOp::attachInterface<
+        AffineDelinearizeIndexOpInterface>(*ctx);
+    AffineLinearizeIndexOp::attachInterface<AffineLinearizeIndexOpInterface>(
+        *ctx);
     AffineMaxOp::attachInterface<AffineMaxOpInterface>(*ctx);
     AffineMinOp::attachInterface<AffineMinOpInterface>(*ctx);
   });
