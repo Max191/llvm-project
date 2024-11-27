@@ -9,6 +9,7 @@
 #include "mlir/Dialect/SCF/IR/ValueBoundsOpInterfaceImpl.h"
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Interfaces/ValueBoundsOpInterface.h"
 
 using namespace mlir;
@@ -95,6 +96,70 @@ struct ForOpInterface
   }
 };
 
+struct ForallOpInterface
+    : public ValueBoundsOpInterface::ExternalModel<ForallOpInterface, ForallOp> {
+
+  static void populateIterArgBounds(scf::ForallOp forallOp, Value value,
+                                    std::optional<int64_t> dim,
+                                    ValueBoundsConstraintSet &cstr) {
+    // `value` is an iter_arg or an OpResult.
+    int64_t iterArgIdx;
+    if (auto iterArg = llvm::dyn_cast<BlockArgument>(value)) {
+      iterArgIdx = iterArg.getArgNumber() - forallOp.getInductionVars().size();
+    } else {
+      iterArgIdx = llvm::cast<OpResult>(value).getResultNumber();
+    }
+
+    Value iterArg = forallOp.getRegionIterArgs()[iterArgIdx];
+    SmallVector<Operation *> combiningOps =
+        forallOp.getCombiningOps(cast<BlockArgument>(iterArg));
+    if (combiningOps.size() != 1)
+      return;
+    Value yieldedValue = cast<tensor::ParallelInsertSliceOp>(
+        combiningOps.front()).getSource();
+    Value initArg = forallOp.getOutputs()[iterArgIdx];
+
+    // An EQ constraint can be added if the yielded value (dimension size)
+    // equals the corresponding block argument (dimension size).
+    if (cstr.populateAndCompare(
+            /*lhs=*/{yieldedValue, dim},
+            ValueBoundsConstraintSet::ComparisonOperator::EQ,
+            /*rhs=*/{iterArg, dim})) {
+      if (dim.has_value()) {
+        cstr.bound(value)[*dim] == cstr.getExpr(initArg, dim);
+      } else {
+        cstr.bound(value) == cstr.getExpr(initArg);
+      }
+    }
+  }
+
+  void populateBoundsForIndexValue(Operation *op, Value value,
+                                   ValueBoundsConstraintSet &cstr) const {
+    auto forallOp = cast<ForallOp>(op);
+
+    auto blockArg = dyn_cast<BlockArgument>(value);
+    if (blockArg && blockArg.getArgNumber() < forallOp.getInductionVars().size()) {
+      int64_t idx = blockArg.getArgNumber();
+      // TODO: Take into account step size.
+      AffineExpr lb = cstr.getExpr(forallOp.getMixedLowerBound()[idx]);
+      AffineExpr ub = cstr.getExpr(forallOp.getMixedUpperBound()[idx]);
+      cstr.bound(value) >= lb;
+      cstr.bound(value) < ub;
+      return;
+    }
+
+    // Handle iter_args and OpResults.
+    populateIterArgBounds(forallOp, value, std::nullopt, cstr);
+  }
+
+  void populateBoundsForShapedValueDim(Operation *op, Value value, int64_t dim,
+                                       ValueBoundsConstraintSet &cstr) const {
+    auto forallOp = cast<ForallOp>(op);
+    // Handle iter_args and OpResults.
+    populateIterArgBounds(forallOp, value, dim, cstr);
+  }
+};
+
 struct IfOpInterface
     : public ValueBoundsOpInterface::ExternalModel<IfOpInterface, IfOp> {
 
@@ -161,6 +226,7 @@ void mlir::scf::registerValueBoundsOpInterfaceExternalModels(
     DialectRegistry &registry) {
   registry.addExtension(+[](MLIRContext *ctx, scf::SCFDialect *dialect) {
     scf::ForOp::attachInterface<scf::ForOpInterface>(*ctx);
+    scf::ForallOp::attachInterface<scf::ForallOpInterface>(*ctx);
     scf::IfOp::attachInterface<scf::IfOpInterface>(*ctx);
   });
 }
