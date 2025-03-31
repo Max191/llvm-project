@@ -1010,7 +1010,6 @@ struct UnPackOpTiling
     // The perfect tiling case indicates that the tiling sizes are multiple of
     // inner_tile_size. In this context, no extra data is needed when
     // representing the tiled unpack op.
-    bool isPerfectTilingCase = true;
     Attribute oneAttr = b.getIndexAttr(1);
     SmallVector<OpFoldResult> sliceSrcStrides(destRank, oneAttr);
     SmallVector<OpFoldResult> sliceSrcIndices, sliceSrcSizes;
@@ -1018,8 +1017,6 @@ struct UnPackOpTiling
     for (auto dim : llvm::seq<int64_t>(0, destRank)) {
       UnpackTileDimInfo info =
           getUnpackTileDimInfo(b, unpackOp, dim, offsets[dim], sizes[dim]);
-      if (!info.isAlignedToInnerTileSize)
-        isPerfectTilingCase = false;
       sliceSrcIndices.push_back(info.sourceOffset);
       sliceSrcSizes.push_back(info.sourceSize);
       destExpandedSizes.push_back(info.destExpandedSize);
@@ -1041,34 +1038,21 @@ struct UnPackOpTiling
     generatedSlices.push_back(sliceSource);
 
     SmallVector<OpFoldResult> destStrides(destRank, oneAttr);
-    Value sliceDest;
-    if (isPerfectTilingCase) {
-      auto destSliceOp = b.create<tensor::ExtractSliceOp>(
-          loc, unpackOp.getDest(), offsets, sizes, destStrides);
-      sliceDest = destSliceOp;
-      generatedSlices.push_back(destSliceOp);
-    } else {
-      sliceDest = b.create<tensor::EmptyOp>(
-          loc, destExpandedSizes, unpackOp.getDestType().getElementType());
-    }
+    auto sliceDest = b.create<tensor::ExtractSliceOp>(
+        loc, unpackOp.getDest(), offsets, sizes, destStrides);
+    generatedSlices.push_back(sliceDest);
 
-    SmallVector<Value> tiledOperands = {sliceSource.getResult(), sliceDest};
+    SmallVector<Value> tiledOperands = {sliceSource.getResult(),
+                                        sliceDest.getResult()};
     for (auto tile : unpackOp.getInnerTiles())
       tiledOperands.push_back(tile);
 
     Operation *tiledUnpackOp = b.create<UnPackOp>(
         loc, TypeRange{sliceDest.getType()}, tiledOperands, op->getAttrs());
 
-    if (isPerfectTilingCase)
-      return TilingResult{{tiledUnpackOp},
-                          SmallVector<Value>(tiledUnpackOp->getResults()),
-                          generatedSlices};
-
-    auto extractSlice = b.create<tensor::ExtractSliceOp>(
-        loc, tiledUnpackOp->getResult(0), resultOffsetsFromDest, sizes,
-        destStrides);
-    return TilingResult{
-        {tiledUnpackOp}, {extractSlice.getResult()}, generatedSlices};
+    return TilingResult{{tiledUnpackOp},
+                        SmallVector<Value>(tiledUnpackOp->getResults()),
+                        generatedSlices};
   }
 
   LogicalResult
