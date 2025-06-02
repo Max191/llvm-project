@@ -1468,7 +1468,7 @@ SmallVector<Operation *> ForallOp::getCombiningOps(BlockArgument bbArg) {
 }
 
 SmallVector<Operation *> ForallOp::getUpdatingOps(OpResult result) {
-  assert(result.getOwner() != *this &&
+  assert(result.getOwner() == *this &&
          "querying updating ops with a result of a different op.");
   return getCombiningOps(getTiedBlockArgument(getTiedOpOperand(result)));
 }
