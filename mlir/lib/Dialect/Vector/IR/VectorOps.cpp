@@ -6316,6 +6316,11 @@ std::optional<SmallVector<int64_t, 4>> TransposeOp::getShapeForUnroll() {
   return llvm::to_vector<4>(getResultVectorType().getShape());
 }
 
+void TransposeOp::inferResultRanges(ArrayRef<ConstantIntRanges> argRanges,
+                                    SetIntRangeFn setResultRanges) {
+  setResultRanges(getResult(), argRanges.front());
+}
+
 namespace {
 
 // Rewrites two back-to-back TransposeOp operations into a single TransposeOp.
@@ -7195,6 +7200,31 @@ Value mlir::vector::makeArithReduction(OpBuilder &b, Location loc,
 
   assert(result && "unknown CombiningKind");
   return selectPassthru(b, mask, result, acc);
+}
+
+//===----------------------------------------------------------------------===//
+// StepOp
+//===----------------------------------------------------------------------===//
+
+void StepOp::inferResultRanges(ArrayRef<ConstantIntRanges> argRanges,
+                               SetIntRangeFn setResultRanges) {
+  auto resultType = cast<VectorType>(getType());
+  if (resultType.isScalable()) {
+    return;
+  }
+  std::optional<ConstantIntRanges> result;
+  Type elementType = resultType.getElementType();
+  unsigned bitwidth = elementType.isIndex()
+      ? IndexType::kInternalStorageBitWidth
+      : elementType.getIntOrFloatBitWidth();
+  int64_t size = resultType.getShape()[0];
+  for (int64_t val : llvm::seq<int64_t>(size)) {
+    auto range = ConstantIntRanges::constant(APInt(bitwidth, val));
+    result = (result ? result->rangeUnion(range) : range);
+  }
+
+  assert(result && "Zero-sized vectors are not allowed");
+  setResultRanges(getResult(), *result);
 }
 
 //===----------------------------------------------------------------------===//
