@@ -38,9 +38,11 @@ class AffineMaxOp;
 class AffineMinOp;
 
 /// Lowers `affine.delinearize_index` into a sequence of division and remainder
-/// operations.
+/// operations. If `positiveIndex` is true, then the source index of the op is
+/// assumed to be positive, which simplifies the arithmetic of the lowering.
 LogicalResult lowerAffineDelinearizeIndexOp(RewriterBase &rewriter,
-                                            AffineDelinearizeIndexOp op);
+                                            AffineDelinearizeIndexOp op,
+                                            bool positiveIndex = false);
 
 /// Lowers `affine.linearize_index` into a sequence of multiplications and
 /// additions. Make a best effort to sort the input indices so that

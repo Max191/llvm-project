@@ -83,9 +83,9 @@ static SmallVector<Value> computeStrides(Location loc, RewriterBase &rewriter,
   return result;
 }
 
-LogicalResult
-affine::lowerAffineDelinearizeIndexOp(RewriterBase &rewriter,
-                                      AffineDelinearizeIndexOp op) {
+LogicalResult affine::lowerAffineDelinearizeIndexOp(RewriterBase &rewriter,
+                                                    AffineDelinearizeIndexOp op,
+                                                    bool positiveIndex) {
   Location loc = op.getLoc();
   Value linearIdx = op.getLinearIndex();
   unsigned numResults = op.getNumResults();
@@ -112,6 +112,9 @@ affine::lowerAffineDelinearizeIndexOp(RewriterBase &rewriter,
 
   auto emitModTerm = [&](Value stride) -> Value {
     Value remainder = arith::RemSIOp::create(rewriter, loc, linearIdx, stride);
+    if (positiveIndex) {
+      return remainder;
+    }
     Value remainderNegative = arith::CmpIOp::create(
         rewriter, loc, arith::CmpIPredicate::slt, remainder, zero);
     // If the correction is relevant, this term is <= stride, which is known
