@@ -33,6 +33,7 @@
 #include "mlir/IR/TypeUtilities.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/FormatVariadic.h"
 
 #define DEBUG_TYPE "vector-to-vector"
@@ -1947,6 +1948,125 @@ struct DropUnitDimFromElementwiseOps final
   }
 };
 
+struct DropUnitDimsFromBroadcastOp final
+    : public OpRewritePattern<vector::BroadcastOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(vector::BroadcastOp broadcastOp,
+                                PatternRewriter &rewriter) const override {
+    VectorType resultVectorType = broadcastOp.getResultVectorType();
+    SmallVector<int64_t> trailingDimsShape;
+    SmallVector<bool> trailingDimsScalableFlags;
+    if (auto sourceVectorType =
+            dyn_cast<VectorType>(broadcastOp.getSourceType())) {
+        trailingDimsShape = SmallVector<int64_t>(sourceVectorType.getShape());
+        trailingDimsScalableFlags =
+            SmallVector<bool>(sourceVectorType.getScalableDims());
+    }
+    ArrayRef<int64_t> leadingDimsShape =
+        resultVectorType.getShape().drop_back(trailingDimsShape.size());
+    if (llvm::none_of(leadingDimsShape, [](int64_t dim) { return dim == 1; })) {
+      return failure();
+    }
+    ArrayRef<bool> leadingDimsScalableFlags =
+        resultVectorType.getScalableDims().drop_back(trailingDimsShape.size());
+    if (llvm::all_of(leadingDimsShape, [](int64_t dim) { return dim == 1; }) &&
+        llvm::count(leadingDimsScalableFlags, true) == 0) {
+      rewriter.replaceOpWithNewOp<ShapeCastOp>(broadcastOp, resultVectorType,
+                                              broadcastOp.getSource());
+      return success();
+    }
+    auto leadingDimsVectorType = VectorType::get(
+        leadingDimsShape, resultVectorType.getElementType(),
+        leadingDimsScalableFlags);
+    VectorType newLeadingDimsVectorType =
+        dropNonScalableUnitDimFromType(leadingDimsVectorType);
+    auto trailingDimsVectorType = VectorType::get(
+        trailingDimsShape, resultVectorType.getElementType(),
+        trailingDimsScalableFlags);
+    VectorType newTrailingDimsVectorType =
+        dropNonScalableUnitDimFromType(trailingDimsVectorType);
+
+    SmallVector<int64_t> newResultShape = llvm::to_vector(
+        llvm::concat<const int64_t>(newLeadingDimsVectorType.getShape(),
+                                    newTrailingDimsVectorType.getShape()));
+    SmallVector<bool> newResultScalableDims = llvm::to_vector(
+        llvm::concat<const bool>(newLeadingDimsVectorType.getScalableDims(),
+                                 newTrailingDimsVectorType.getScalableDims()));
+    auto newResultVectorType = VectorType::get(
+        newResultShape, resultVectorType.getElementType(),
+        newResultScalableDims);
+    // Cast away unit dims in source, if there are any.
+    Location loc = broadcastOp.getLoc();
+    Value newSource = broadcastOp.getSource();
+    if (newTrailingDimsVectorType != broadcastOp.getSourceType() &&
+        isa<VectorType>(broadcastOp.getSourceType())) {
+      newSource = rewriter.create<ShapeCastOp>(
+          loc, newTrailingDimsVectorType, broadcastOp.getSource());
+    }
+    // Create an updated broadcast op without unit dim.
+    auto newBroadcastOp = rewriter.create<vector::BroadcastOp>(
+        loc, newResultVectorType, newSource);
+
+    // Restore the unit dim by applying vector.shape_cast to the result.
+    rewriter.replaceOpWithNewOp<ShapeCastOp>(broadcastOp, resultVectorType,
+                                             newBroadcastOp.getResult());
+
+    return success();
+  }
+};
+
+struct DropUnitDimsFromStridedSliceOp final
+    : public OpRewritePattern<vector::InsertStridedSliceOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(vector::InsertStridedSliceOp insertOp,
+                                PatternRewriter &rewriter) const override {
+    SmallVector<int64_t> strides = llvm::map_to_vector(
+        insertOp.getStrides().getValue(),
+        [](Attribute offset) { return cast<IntegerAttr>(offset).getInt(); });
+    if (llvm::count(strides, 1) != strides.size()) {
+      return failure();
+    }
+    VectorType resultVectorType = insertOp.getDestVectorType();
+    if (llvm::count(resultVectorType.getShape(), 1) == 0) {
+      return failure();
+    }
+    VectorType srcVectorType = insertOp.getSourceVectorType();
+    if (srcVectorType.getRank() != 1 || srcVectorType.getShape()[0] == 1) {
+      return failure();
+    }
+    SmallVector<int64_t> offsets = llvm::map_to_vector(
+        insertOp.getOffsets().getValue(),
+        [](Attribute offset) { return cast<IntegerAttr>(offset).getInt(); });
+    SmallVector<int64_t> newShape;
+    SmallVector<bool> newScalableDims;
+    SmallVector<int64_t> newOffsets;
+    for (auto [idx, dim, isScalable] :
+        llvm::enumerate(resultVectorType.getShape(),
+                        resultVectorType.getScalableDims())) {
+      if (dim == 1 && !isScalable)
+        continue;
+
+      newShape.push_back(dim);
+      newScalableDims.push_back(isScalable);
+      newOffsets.push_back(offsets[idx]);
+    }
+    auto newResultVectorType = VectorType::get(
+        newShape, srcVectorType.getElementType(), newScalableDims);
+
+    Location loc = insertOp.getLoc();
+    Value newDest = rewriter.create<ShapeCastOp>(
+        loc, newResultVectorType, insertOp.getDest());
+    auto newInsertOp = rewriter.create<vector::InsertStridedSliceOp>(
+        loc, insertOp.getValueToStore(), newDest, newOffsets, strides);
+
+    // Restore the unit dim by applying vector.shape_cast to the result.
+    rewriter.replaceOpWithNewOp<ShapeCastOp>(insertOp, resultVectorType,
+                                             newInsertOp.getResult());
+
+    return success();
+  }
+};
+
 /// A pattern to drop unit dims from vector.transpose.
 ///
 /// Example:
@@ -2276,6 +2396,7 @@ void mlir::vector::populateVectorMaskMaterializationPatterns(
 void mlir::vector::populateDropUnitDimWithShapeCastPatterns(
     RewritePatternSet &patterns, PatternBenefit benefit) {
   patterns.add<DropUnitDimFromElementwiseOps, DropUnitDimsFromScfForOp,
+               DropUnitDimsFromBroadcastOp, DropUnitDimsFromStridedSliceOp,
                DropUnitDimsFromTransposeOp>(patterns.getContext(), benefit);
 }
 
