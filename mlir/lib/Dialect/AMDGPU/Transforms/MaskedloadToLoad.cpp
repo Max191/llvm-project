@@ -225,9 +225,7 @@ struct FullMaskedStoreToConditionalStore
 
 void mlir::amdgpu::populateAmdgpuMaskedloadToLoadPatterns(
     RewritePatternSet &patterns, PatternBenefit benefit) {
-  patterns.add<MaskedLoadLowering, FullMaskedLoadToConditionalLoad,
-               FullMaskedStoreToConditionalStore>(patterns.getContext(),
-                                                  benefit);
+  patterns.add<MaskedLoadLowering>(patterns.getContext(), benefit);
 }
 
 struct AmdgpuMaskedloadToLoadPass final
