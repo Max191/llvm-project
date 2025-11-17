@@ -160,6 +160,9 @@ bool simplifyAffineMaxOp(RewriterBase &rewriter, AffineMaxOp op);
 LogicalResult simplifyAffineMinMaxOps(RewriterBase &rewriter,
                                       ArrayRef<Operation *> ops,
                                       bool *modified = nullptr);
+
+void populateSimplifyAffineMinMaxPatterns(RewritePatternSet &patterns);
+
 } // namespace affine
 } // namespace mlir
 

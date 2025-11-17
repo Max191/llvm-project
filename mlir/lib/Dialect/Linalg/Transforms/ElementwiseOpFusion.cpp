@@ -1038,6 +1038,71 @@ private:
   ControlFusionFn controlFoldingReshapes;
 };
 
+/// Helper function to compute padding in expanded space when folding
+/// pad operations with reshape operations.
+/// This computes the new padding values and shape for the expanded tensor.
+///
+/// \param padOp The pad operation
+/// \param expandedShape The shape of the expanded tensor
+/// \param reassociations The reassociation indices for the reshape
+/// \param rewriter The pattern rewriter
+/// \param newLow Output parameter for new low padding in expanded space
+/// \param newHigh Output parameter for new high padding in expanded space
+/// \param expandedPaddedShape Output parameter for the expanded padded shape
+/// \return success if the padding can be computed, failure otherwise
+static LogicalResult computeExpandedPadding(
+    tensor::PadOp padOp, ArrayRef<int64_t> expandedShape,
+    ArrayRef<ReassociationIndices> reassociations, PatternRewriter &rewriter,
+    SmallVector<OpFoldResult> &newLow, SmallVector<OpFoldResult> &newHigh,
+    SmallVector<int64_t> &expandedPaddedShape) {
+  ArrayRef<int64_t> low = padOp.getStaticLow();
+  ArrayRef<int64_t> high = padOp.getStaticHigh();
+  SmallVector<OpFoldResult> mixedLowPad(padOp.getMixedLowPad());
+  SmallVector<OpFoldResult> mixedHighPad(padOp.getMixedHighPad());
+  ArrayRef<int64_t> paddedShape = padOp.getResultType().getShape();
+
+  // Padding expanded dimensions is only allowed if the expansion is only
+  // introducing unit dimensions.
+  SmallVector<std::optional<int64_t>> dimsToPad;
+  for (auto [reInd, l, h] : llvm::zip_equal(reassociations, low, high)) {
+    if (reInd.size() == 1 || (l == 0 && h == 0)) {
+      dimsToPad.push_back(std::nullopt);
+      continue;
+    }
+    std::optional<int64_t> nonUnitDim;
+    for (int64_t dim : reInd) {
+      if (expandedShape[dim] == 1)
+        continue;
+      if (nonUnitDim.has_value())
+        return failure();
+      nonUnitDim = dim;
+    }
+    if (!nonUnitDim.has_value())
+      return failure();
+    dimsToPad.push_back(nonUnitDim);
+  }
+
+  newLow.assign(expandedShape.size(), rewriter.getIndexAttr(0));
+  newHigh.assign(expandedShape.size(), rewriter.getIndexAttr(0));
+  expandedPaddedShape.assign(expandedShape.begin(), expandedShape.end());
+  for (auto [idx, reInd] : llvm::enumerate(reassociations)) {
+    if (reInd.size() == 1) {
+      expandedPaddedShape[reInd[0]] = paddedShape[idx];
+      newLow[reInd[0]] = mixedLowPad[idx];
+      newHigh[reInd[0]] = mixedHighPad[idx];
+      continue;
+    }
+    std::optional<int64_t> dimToPad = dimsToPad[idx];
+    if (dimToPad.has_value()) {
+      expandedPaddedShape[*dimToPad] = paddedShape[idx];
+      newLow[*dimToPad] = mixedLowPad[idx];
+      newHigh[*dimToPad] = mixedHighPad[idx];
+    }
+  }
+
+  return success();
+}
+
 class FoldPadWithProducerReshapeOpByExpansion
     : public OpRewritePattern<tensor::PadOp> {
 public:
@@ -1061,38 +1126,91 @@ public:
                                          "fusion blocked by control function");
     }
 
-    ArrayRef<int64_t> low = padOp.getStaticLow();
-    ArrayRef<int64_t> high = padOp.getStaticHigh();
+    RankedTensorType expandedType = reshapeOp.getSrcType();
     SmallVector<ReassociationIndices> reassociations =
         reshapeOp.getReassociationIndices();
-
-    for (auto [reInd, l, h] : llvm::zip_equal(reassociations, low, high)) {
-      if (reInd.size() != 1 && (l != 0 || h != 0))
-        return failure();
-    }
-
     SmallVector<OpFoldResult> newLow, newHigh;
-    RankedTensorType expandedType = reshapeOp.getSrcType();
-    RankedTensorType paddedType = padOp.getResultType();
-    SmallVector<int64_t> expandedPaddedShape(expandedType.getShape());
-    for (auto [idx, reInd] : llvm::enumerate(reassociations)) {
-      if (reInd.size() == 1) {
-        expandedPaddedShape[reInd[0]] = paddedType.getShape()[idx];
-      }
-      for (size_t i = 0; i < reInd.size(); ++i) {
-        newLow.push_back(padOp.getMixedLowPad()[idx]);
-        newHigh.push_back(padOp.getMixedHighPad()[idx]);
-      }
+    SmallVector<int64_t> expandedPaddedShape;
+    if (failed(computeExpandedPadding(padOp, expandedType.getShape(),
+                                      reassociations, rewriter, newLow, newHigh,
+                                      expandedPaddedShape))) {
+      return failure();
     }
 
     Location loc = padOp->getLoc();
-    RankedTensorType expandedPaddedType = paddedType.clone(expandedPaddedShape);
+    RankedTensorType expandedPaddedType =
+        padOp.getResultType().clone(expandedPaddedShape);
+
     auto newPadOp = tensor::PadOp::create(
         rewriter, loc, expandedPaddedType, reshapeOp.getSrc(), newLow, newHigh,
         padOp.getConstantPaddingValue(), padOp.getNofold());
 
     rewriter.replaceOpWithNewOp<tensor::CollapseShapeOp>(
         padOp, padOp.getResultType(), newPadOp.getResult(), reassociations);
+
+    return success();
+  }
+
+private:
+  ControlFusionFn controlFoldingReshapes;
+};
+
+class FoldExpandShapeWithProducerPadOp
+    : public OpRewritePattern<tensor::ExpandShapeOp> {
+public:
+  FoldExpandShapeWithProducerPadOp(MLIRContext *context,
+                                   ControlFusionFn foldReshapes,
+                                   PatternBenefit benefit = 1)
+      : OpRewritePattern<tensor::ExpandShapeOp>(context, benefit),
+        controlFoldingReshapes(std::move(foldReshapes)) {}
+
+  LogicalResult matchAndRewrite(tensor::ExpandShapeOp expandOp,
+                                PatternRewriter &rewriter) const override {
+    tensor::PadOp padOp =
+        expandOp.getSrc().getDefiningOp<tensor::PadOp>();
+    if (!padOp)
+      return failure();
+    if (!padOp->hasOneUse())
+      return failure();
+
+    if (!controlFoldingReshapes(&expandOp.getSrcMutable())) {
+      return rewriter.notifyMatchFailure(expandOp,
+                                         "fusion blocked by control function");
+    }
+
+    RankedTensorType expandedType = expandOp.getResultType();
+    SmallVector<ReassociationIndices> reassociations =
+        expandOp.getReassociationIndices();
+    SmallVector<OpFoldResult> newLow, newHigh;
+    SmallVector<int64_t> expandedPaddedShape;
+    if (failed(computeExpandedPadding(padOp, expandedType.getShape(),
+                                      reassociations, rewriter, newLow, newHigh,
+                                      expandedPaddedShape)))
+      return failure();
+
+    Location loc = expandOp->getLoc();
+    SmallVector<OpFoldResult> newExpandedSizes(
+        expandedType.getRank(), rewriter.getIndexAttr(1));
+    SmallVector<int64_t> newExpandedShape(expandedType.getRank(), 1);
+    rewriter.setInsertionPointAfterValue(padOp.getSource());
+    SmallVector<OpFoldResult> padSrcSizes = tensor::getMixedSizes(
+        rewriter, loc, padOp.getSource());
+    for (auto [idx, reInd] : llvm::enumerate(reassociations)) {
+      newExpandedShape[reInd.back()] = padOp.getSourceType().getDimSize(idx);
+      newExpandedSizes[reInd.back()] = padSrcSizes[idx];
+    }
+    RankedTensorType newExpandedType = expandedType.clone(newExpandedShape);
+    auto newExpandOp = tensor::ExpandShapeOp::create(
+        rewriter, loc, newExpandedType, padOp.getSource(), reassociations,
+        newExpandedSizes);
+    RankedTensorType expandedPaddedType =
+        padOp.getResultType().clone(expandedPaddedShape);
+    rewriter.setInsertionPoint(expandOp);
+    auto newPadOp = tensor::PadOp::create(
+        rewriter, loc, expandedPaddedType, newExpandOp.getResult(), newLow,
+        newHigh, padOp.getConstantPaddingValue(), padOp.getNofold());
+
+    rewriter.replaceOp(expandOp, newPadOp.getResult());
 
     return success();
   }
@@ -2000,6 +2118,86 @@ private:
   ControlFusionFn controlFoldingReshapes;
 };
 
+class FoldReshapeWithProducerPadOpByCollapsing
+    : public OpRewritePattern<tensor::CollapseShapeOp> {
+public:
+  FoldReshapeWithProducerPadOpByCollapsing(MLIRContext *context,
+                                           ControlFusionFn foldReshapes,
+                                           PatternBenefit benefit = 1)
+      : OpRewritePattern<tensor::CollapseShapeOp>(context, benefit),
+        controlFoldingReshapes(std::move(foldReshapes)) {}
+
+  LogicalResult matchAndRewrite(tensor::CollapseShapeOp reshapeOp,
+                                PatternRewriter &rewriter) const override {
+    tensor::PadOp padOp =
+        reshapeOp.getSrc().getDefiningOp<tensor::PadOp>();
+    if (!padOp)
+      return failure();
+    if (!padOp->hasOneUse())
+      return failure();
+
+    if (!controlFoldingReshapes(&reshapeOp.getSrcMutable())) {
+      return rewriter.notifyMatchFailure(padOp,
+                                         "fusion blocked by control function");
+    }
+
+    ArrayRef<int64_t> low = padOp.getStaticLow();
+    ArrayRef<int64_t> high = padOp.getStaticHigh();
+    SmallVector<ReassociationIndices> reassociations =
+        reshapeOp.getReassociationIndices();
+
+    RankedTensorType expandedType = reshapeOp.getSrcType();
+    RankedTensorType padSrcType = padOp.getSourceType();
+    SmallVector<int64_t> paddedDims;
+    for (auto [idx, reInd] : llvm::enumerate(reassociations)) {
+      if (reInd.size() == 1) {
+        paddedDims.push_back(reInd[0]);
+        continue;
+      }
+      std::optional<int64_t> nonUnitDim;
+      for (int64_t dim : reInd) {
+        int64_t unpaddedSize = padSrcType.getDimSize(dim);
+        int64_t paddedSize = expandedType.getDimSize(dim);
+        if (unpaddedSize == 1 && paddedSize == 1)
+          continue;
+        if (nonUnitDim.has_value())
+          return failure();
+        nonUnitDim = dim;
+      }
+      if (!nonUnitDim.has_value())
+        return failure();
+      paddedDims.push_back(nonUnitDim.value());
+    }
+
+    SmallVector<OpFoldResult> newLow, newHigh;
+    RankedTensorType paddedType = padOp.getResultType();
+    SmallVector<int64_t> collapsedPaddedShape;
+    for (auto [idx, paddedDim] : llvm::enumerate(paddedDims)) {
+      OpFoldResult l = padOp.getMixedLowPad()[paddedDim];
+      OpFoldResult h = padOp.getMixedHighPad()[paddedDim];
+      newLow.push_back(l);
+      newHigh.push_back(h);
+      collapsedPaddedShape.push_back(paddedType.getDimSize(paddedDim));
+    }
+
+    Location loc = reshapeOp->getLoc();
+    auto newCollapseOp = tensor::CollapseShapeOp::create(
+      rewriter, loc, padOp.getSource(), reassociations);
+
+    RankedTensorType collapsedPaddedType =
+        paddedType.clone(collapsedPaddedShape);
+    auto newPadOp = tensor::PadOp::create(
+        rewriter, loc, collapsedPaddedType, newCollapseOp.getResult(), newLow,
+        newHigh, padOp.getConstantPaddingValue(), padOp.getNofold());
+
+    rewriter.replaceOp(reshapeOp, newPadOp.getResult());
+    return success();
+  }
+
+private:
+  ControlFusionFn controlFoldingReshapes;
+};
+
 /// Pattern to collapse dimensions.
 template <typename LinalgType>
 class CollapseLinalgDimensions : public OpRewritePattern<LinalgType> {
@@ -2239,6 +2437,8 @@ void mlir::linalg::populateFoldReshapeOpsByExpansionPatterns(
                                                     controlFoldingReshapes);
   patterns.add<FoldPadWithProducerReshapeOpByExpansion>(patterns.getContext(),
                                                         controlFoldingReshapes);
+  patterns.add<FoldExpandShapeWithProducerPadOp>(patterns.getContext(),
+                                                 controlFoldingReshapes);
   patterns.add<FoldWithProducerReshapeOpByExpansion>(patterns.getContext(),
                                                      controlFoldingReshapes);
 }
@@ -2249,6 +2449,8 @@ void mlir::linalg::populateFoldReshapeOpsByCollapsingPatterns(
   patterns.add<FoldWithProducerReshapeOpByCollapsing>(patterns.getContext(),
                                                       controlFoldingReshapes);
   patterns.add<FoldPadWithProducerReshapeOpByCollapsing>(
+      patterns.getContext(), controlFoldingReshapes);
+  patterns.add<FoldReshapeWithProducerPadOpByCollapsing>(
       patterns.getContext(), controlFoldingReshapes);
   patterns.add<FoldReshapeWithGenericOpByCollapsing>(patterns.getContext(),
                                                      controlFoldingReshapes);

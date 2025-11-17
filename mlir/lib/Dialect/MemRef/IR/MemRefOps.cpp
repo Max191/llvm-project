@@ -2551,15 +2551,16 @@ computeCollapsedLayoutMap(MemRefType srcType,
     ArrayRef<int64_t> ref = llvm::ArrayRef(reassoc);
     while (srcShape[ref.back()] == 1 && ref.size() > 1)
       ref = ref.drop_back();
-    if (ShapedType::isStatic(srcShape[ref.back()]) || ref.size() == 1) {
-      resultStrides.push_back(srcStrides[ref.back()]);
-    } else {
-      // Dynamically-sized dims may turn out to be dims of size 1 at runtime, so
-      // the corresponding stride may have to be skipped. (See above comment.)
-      // Therefore, the result stride cannot be statically determined and must
-      // be dynamic.
-      resultStrides.push_back(ShapedType::kDynamic);
-    }
+    resultStrides.push_back(srcStrides[ref.back()]);
+    // if (ShapedType::isStatic(srcShape[ref.back()]) || ref.size() == 1) {
+    //   resultStrides.push_back(srcStrides[ref.back()]);
+    // } else {
+    //   // Dynamically-sized dims may turn out to be dims of size 1 at runtime, so
+    //   // the corresponding stride may have to be skipped. (See above comment.)
+    //   // Therefore, the result stride cannot be statically determined and must
+    //   // be dynamic.
+    //   resultStrides.push_back(ShapedType::kDynamic);
+    // }
   }
 
   // Validate that each reassociation group is contiguous.
@@ -2579,13 +2580,16 @@ computeCollapsedLayoutMap(MemRefType srcType,
       // where we cannot be sure statically. Such ops may fail at runtime. See
       // the op documentation for details.
       auto srcStride = SaturatedInteger::wrap(srcStrides[idx - 1]);
-      if (strict && (stride.saturated || srcStride.saturated))
-        return failure();
+      // if (strict && (stride.saturated || srcStride.saturated))
+      //   return failure();
 
       // Dimensions of size 1 should be skipped, because their strides are
       // meaningless and could have any arbitrary value.
       if (srcShape[idx - 1] == 1)
         continue;
+
+      if (strict && (stride.saturated || srcStride.saturated))
+        return failure();
 
       if (!stride.saturated && !srcStride.saturated && stride != srcStride)
         return failure();

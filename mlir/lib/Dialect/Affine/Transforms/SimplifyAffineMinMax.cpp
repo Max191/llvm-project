@@ -249,3 +249,10 @@ void SimplifyAffineMinMaxPass::runOnOperation() {
   if (failed(applyPatternsGreedily(func, frozenPatterns)))
     return signalPassFailure();
 }
+
+void affine::populateSimplifyAffineMinMaxPatterns(RewritePatternSet &patterns) {
+  AffineMaxOp::getCanonicalizationPatterns(patterns, patterns.getContext());
+  AffineMinOp::getCanonicalizationPatterns(patterns, patterns.getContext());
+  patterns.add<SimplifyAffineMaxOp, SimplifyAffineMinOp, SimplifyAffineApplyOp>(
+      patterns.getContext());
+}
