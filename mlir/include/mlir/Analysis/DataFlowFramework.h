@@ -331,8 +331,9 @@ public:
   template <typename AnalysisT, typename... Args>
   AnalysisT *load(Args &&...args);
 
-  /// Initialize the children analyses starting from the provided top-level
-  /// operation and run the analysis until fixpoint.
+  /// Initialize the children analyses from scratch starting from the provided
+  /// top-level operation and run the analysis until fixpoint, discarding any
+  /// previously computed analysis state.
   LogicalResult initializeAndRun(Operation *top);
 
   /// Initialize any loaded analyses that have not yet been initialized for the
@@ -366,10 +367,11 @@ public:
   void eraseAllStates() {
     analysisStates.clear();
     equivalentAnchorMap.clear();
-    initializedEquivalentAnalysisCount = 0;
     initializedAnalysisCount = 0;
     analysisRoot = nullptr;
-    worklist = std::queue<std::pair<ProgramPoint *, DataFlowAnalysis *>>();
+    hasFailedRun = false;
+    while (!worklist.empty())
+      worklist.pop();
   }
 
   /// Get a uniqued lattice anchor instance. If one is not present, it is
@@ -465,13 +467,13 @@ private:
   /// The root operation the current solver session was initialized with.
   Operation *analysisRoot = nullptr;
 
-  /// The number of analyses that have had their equivalent lattice anchors
-  /// initialized for the current solver session.
-  size_t initializedEquivalentAnalysisCount = 0;
-
   /// The number of analyses that have been initialized for the current solver
   /// session.
   size_t initializedAnalysisCount = 0;
+
+  /// Whether the current solver session has failed and must be reset before
+  /// attempting an incremental run.
+  bool hasFailedRun = false;
 
   /// Type-erased instances of the children analyses.
   SmallVector<std::unique_ptr<DataFlowAnalysis>> childAnalyses;

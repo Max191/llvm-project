@@ -307,13 +307,21 @@ void TestStagedAnalysesPass::runOnOperation() {
   solver.load<FooAnalysis>(&stats);
   if (failed(solver.initializeAndRun(func)))
     return signalPassFailure();
+  if (failed(solver.initializeAndRun(func)))
+    return signalPassFailure();
+
+  if (stats.initializeCount != 2) {
+    func.emitError("expected FooAnalysis to be initialized exactly twice "
+                   "after two full solver runs");
+    return signalPassFailure();
+  }
 
   solver.load<BarAnalysis>();
   if (failed(solver.initializeAndRunPendingAnalyses(func)))
     return signalPassFailure();
-
-  if (stats.initializeCount != 1) {
-    func.emitError("expected FooAnalysis to be initialized exactly once");
+  if (stats.initializeCount != 2) {
+    func.emitError("expected pending analyses to preserve converged "
+                   "FooAnalysis results without reinitializing FooAnalysis");
     return signalPassFailure();
   }
 

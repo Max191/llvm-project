@@ -110,20 +110,15 @@ Location LatticeAnchor::getLoc() const {
 //===----------------------------------------------------------------------===//
 
 LogicalResult DataFlowSolver::initializeAndRun(Operation *top) {
-  if (initializedAnalysisCount != 0) {
-    return top->emitError("dataflow solver has already been initialized; call "
-                          "'eraseAllStates()' to restart or "
-                          "'initializeAndRunPendingAnalyses()' to run newly "
-                          "loaded analyses");
-  }
+  eraseAllStates();
   return initializeAndRunImpl(top, /*firstAnalysis=*/0);
 }
 
 LogicalResult DataFlowSolver::initializeAndRunPendingAnalyses(Operation *top) {
-  if (initializedEquivalentAnalysisCount != initializedAnalysisCount) {
-    return top->emitError("dataflow solver is in a partially initialized "
-                          "state after a previous failure; call "
-                          "'eraseAllStates()' before reusing it");
+  if (hasFailedRun) {
+    return top->emitError("dataflow solver is in a failed state after a "
+                          "previous run; call 'initializeAndRun()' to "
+                          "restart or 'eraseAllStates()' before reusing it");
   }
   if (analysisRoot && analysisRoot != top) {
     return top->emitError("dataflow solver can only be resumed with the same "
@@ -135,6 +130,7 @@ LogicalResult DataFlowSolver::initializeAndRunPendingAnalyses(Operation *top) {
 LogicalResult DataFlowSolver::initializeAndRunImpl(Operation *top,
                                                    size_t firstAnalysis) {
   analysisRoot = top;
+  hasFailedRun = true;
 
   // Enable enqueue to the worklist.
   isRunning = true;
@@ -150,7 +146,6 @@ LogicalResult DataFlowSolver::initializeAndRunImpl(Operation *top,
   for (size_t i = firstAnalysis, e = childAnalyses.size(); i != e; ++i) {
     DataFlowAnalysis &analysis = *childAnalyses[i];
     analysis.initializeEquivalentLatticeAnchor(top);
-    ++initializedEquivalentAnalysisCount;
   }
 
   // Initialize the analyses.
@@ -159,10 +154,14 @@ LogicalResult DataFlowSolver::initializeAndRunImpl(Operation *top,
     DATAFLOW_DEBUG(LDBG() << "Priming analysis: " << analysis.debugName);
     if (failed(analysis.initialize(top)))
       return failure();
-    ++initializedAnalysisCount;
   }
 
-  return runToFixpoint();
+  if (failed(runToFixpoint()))
+    return failure();
+
+  initializedAnalysisCount = childAnalyses.size();
+  hasFailedRun = false;
+  return success();
 }
 
 LogicalResult DataFlowSolver::runToFixpoint() {
