@@ -335,6 +335,14 @@ public:
   /// operation and run the analysis until fixpoint.
   LogicalResult initializeAndRun(Operation *top);
 
+  /// Initialize any loaded analyses that have not yet been initialized for the
+  /// current solver session, then continue running the solver until fixpoint.
+  ///
+  /// This preserves all previously computed analysis states and is intended for
+  /// staged analysis pipelines where later analyses depend on the converged
+  /// results of earlier ones.
+  LogicalResult initializeAndRunPendingAnalyses(Operation *top);
+
   /// Lookup an analysis state for the given lattice anchor. Returns null if one
   /// does not exist.
   template <typename StateT, typename AnchorT>
@@ -358,6 +366,10 @@ public:
   void eraseAllStates() {
     analysisStates.clear();
     equivalentAnchorMap.clear();
+    initializedEquivalentAnalysisCount = 0;
+    initializedAnalysisCount = 0;
+    analysisRoot = nullptr;
+    worklist = std::queue<std::pair<ProgramPoint *, DataFlowAnalysis *>>();
   }
 
   /// Get a uniqued lattice anchor instance. If one is not present, it is
@@ -432,6 +444,13 @@ public:
   const DataFlowConfig &getConfig() const { return config; }
 
 private:
+  /// Initialize analyses in the range [firstAnalysis, childAnalyses.size())
+  /// and continue running the solver until fixpoint.
+  LogicalResult initializeAndRunImpl(Operation *top, size_t firstAnalysis);
+
+  /// Drain the worklist to a fixpoint.
+  LogicalResult runToFixpoint();
+
   /// Configuration of the dataflow solver.
   DataFlowConfig config;
 
@@ -442,6 +461,17 @@ private:
   /// queue to be processed greedily, speeding up computations that otherwise
   /// quickly degenerate to quadratic due to propagation of state updates.
   std::queue<WorkItem> worklist;
+
+  /// The root operation the current solver session was initialized with.
+  Operation *analysisRoot = nullptr;
+
+  /// The number of analyses that have had their equivalent lattice anchors
+  /// initialized for the current solver session.
+  size_t initializedEquivalentAnalysisCount = 0;
+
+  /// The number of analyses that have been initialized for the current solver
+  /// session.
+  size_t initializedAnalysisCount = 0;
 
   /// Type-erased instances of the children analyses.
   SmallVector<std::unique_ptr<DataFlowAnalysis>> childAnalyses;
@@ -764,9 +794,23 @@ bool DataFlowSolver::isEquivalent(LatticeAnchor lhs, LatticeAnchor rhs) const {
 
 template <typename StateT, typename AnchorT>
 void DataFlowSolver::unionLatticeAnchors(AnchorT anchor, AnchorT other) {
+  LatticeAnchor lhs = getLeaderAnchorOrSelf<StateT>(LatticeAnchor(anchor));
+  LatticeAnchor rhs = getLeaderAnchorOrSelf<StateT>(LatticeAnchor(other));
+  if (lhs == rhs)
+    return;
+
+  auto hasStateForAnchor = [&](LatticeAnchor latticeAnchor) {
+    auto anchorIt = analysisStates.find(latticeAnchor);
+    return anchorIt != analysisStates.end() &&
+           anchorIt->second.contains(TypeID::get<StateT>());
+  };
+  assert(!hasStateForAnchor(lhs) && !hasStateForAnchor(rhs) &&
+         "cannot union lattice anchors after analysis states have been "
+         "materialized for the state type");
+
   llvm::EquivalenceClasses<LatticeAnchor> &eqClass =
       equivalentAnchorMap[TypeID::get<StateT>()];
-  eqClass.unionSets(LatticeAnchor(anchor), LatticeAnchor(other));
+  eqClass.unionSets(lhs, rhs);
 }
 
 inline raw_ostream &operator<<(raw_ostream &os, const AnalysisState &state) {

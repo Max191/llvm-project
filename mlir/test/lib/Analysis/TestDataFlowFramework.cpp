@@ -8,12 +8,19 @@
 
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/Pass/Pass.h"
 #include <optional>
 
 using namespace mlir;
 
 namespace {
+constexpr char kTagAttrName[] = "tag";
+constexpr char kFooAttrName[] = "foo";
+constexpr char kBarAddAttrName[] = "bar_add";
+constexpr char kFooStateAttrName[] = "foo_state";
+constexpr char kBarStateAttrName[] = "bar_state";
+
 /// This analysis state represents an integer that is XOR'd with other states.
 class FooState : public AnalysisState {
 public:
@@ -65,12 +72,66 @@ private:
   std::optional<uint64_t> state;
 };
 
+struct FooAnalysisStats {
+  unsigned initializeCount = 0;
+};
+
 /// This analysis computes `FooState` across operations and control-flow edges.
 /// If an op specifies a `foo` integer attribute, the contained value is XOR'd
 /// with the value before the operation.
 class FooAnalysis : public DataFlowAnalysis {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FooAnalysis)
+
+  explicit FooAnalysis(DataFlowSolver &solver,
+                       FooAnalysisStats *stats = nullptr)
+      : DataFlowAnalysis(solver), stats(stats) {}
+
+  LogicalResult initialize(Operation *top) override;
+  LogicalResult visit(ProgramPoint *point) override;
+
+private:
+  void visitBlock(Block *block);
+  void visitOperation(Operation *op);
+
+  FooAnalysisStats *stats;
+};
+
+/// This analysis state stores a value derived from a converged `FooState`.
+class BarState : public AnalysisState {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(BarState)
+
+  using AnalysisState::AnalysisState;
+
+  bool isUninitialized() const { return !state; }
+
+  void print(raw_ostream &os) const override {
+    if (state)
+      os << *state;
+    else
+      os << "none";
+  }
+
+  ChangeResult set(uint64_t value) {
+    if (state == value)
+      return ChangeResult::NoChange;
+    state = value;
+    return ChangeResult::Change;
+  }
+
+  uint64_t getValue() const { return *state; }
+
+private:
+  std::optional<uint64_t> state;
+};
+
+/// This analysis is intended to be loaded after `FooAnalysis` has converged.
+/// It reads the current `FooState` at each program point and derives a second
+/// state by adding an optional per-operation offset.
+class BarAnalysis : public DataFlowAnalysis {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(BarAnalysis)
 
   using DataFlowAnalysis::DataFlowAnalysis;
 
@@ -80,6 +141,7 @@ public:
 private:
   void visitBlock(Block *block);
   void visitOperation(Operation *op);
+  void visitPoint(ProgramPoint *point, uint64_t offset);
 };
 
 struct TestFooAnalysisPass
@@ -90,9 +152,21 @@ struct TestFooAnalysisPass
 
   void runOnOperation() override;
 };
+
+struct TestStagedAnalysesPass
+    : public PassWrapper<TestStagedAnalysesPass, OperationPass<func::FuncOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TestStagedAnalysesPass)
+
+  StringRef getArgument() const override { return "test-staged-analyses"; }
+
+  void runOnOperation() override;
+};
 } // namespace
 
 LogicalResult FooAnalysis::initialize(Operation *top) {
+  if (stats)
+    ++stats->initializeCount;
+
   if (top->getNumRegions() != 1)
     return top->emitError("expected a single region top-level op");
 
@@ -151,11 +225,56 @@ void FooAnalysis::visitOperation(Operation *op) {
   result |= state->set(*prevState);
 
   // Modify the state with the attribute, if specified.
-  if (auto attr = op->getAttrOfType<IntegerAttr>("foo")) {
+  if (auto attr = op->getAttrOfType<IntegerAttr>(kFooAttrName)) {
     uint64_t value = attr.getUInt();
     result |= state->join(value);
   }
   propagateIfChanged(state, result);
+}
+
+LogicalResult BarAnalysis::initialize(Operation *top) {
+  if (top->getNumRegions() != 1)
+    return top->emitError("expected a single region top-level op");
+
+  if (top->getRegion(0).getBlocks().empty())
+    return top->emitError("expected at least one block in the region");
+
+  for (Block &block : top->getRegion(0)) {
+    visitBlock(&block);
+    for (Operation &op : block) {
+      if (op.getNumRegions())
+        return op.emitError("unexpected op with regions");
+      visitOperation(&op);
+    }
+  }
+  return success();
+}
+
+LogicalResult BarAnalysis::visit(ProgramPoint *point) {
+  if (!point->isBlockStart())
+    visitOperation(point->getPrevOp());
+  else
+    visitBlock(point->getBlock());
+  return success();
+}
+
+void BarAnalysis::visitBlock(Block *block) {
+  visitPoint(getProgramPointBefore(block), /*offset=*/0);
+}
+
+void BarAnalysis::visitOperation(Operation *op) {
+  uint64_t offset = 0;
+  if (auto attr = op->getAttrOfType<IntegerAttr>(kBarAddAttrName))
+    offset = attr.getUInt();
+  visitPoint(getProgramPointAfter(op), offset);
+}
+
+void BarAnalysis::visitPoint(ProgramPoint *point, uint64_t offset) {
+  BarState *state = getOrCreate<BarState>(point);
+  const FooState *fooState = getOrCreateFor<FooState>(point, point);
+  if (fooState->isUninitialized())
+    return;
+  propagateIfChanged(state, state->set(fooState->getValue() + offset));
 }
 
 void TestFooAnalysisPass::runOnOperation() {
@@ -169,7 +288,7 @@ void TestFooAnalysisPass::runOnOperation() {
   os << "function: @" << func.getSymName() << "\n";
 
   func.walk([&](Operation *op) {
-    auto tag = op->getAttrOfType<StringAttr>("tag");
+    auto tag = op->getAttrOfType<StringAttr>(kTagAttrName);
     if (!tag)
       return;
     const FooState *state =
@@ -179,8 +298,47 @@ void TestFooAnalysisPass::runOnOperation() {
   });
 }
 
+void TestStagedAnalysesPass::runOnOperation() {
+  func::FuncOp func = getOperation();
+  Builder builder(func.getContext());
+
+  FooAnalysisStats stats;
+  DataFlowSolver solver;
+  solver.load<FooAnalysis>(&stats);
+  if (failed(solver.initializeAndRun(func)))
+    return signalPassFailure();
+
+  solver.load<BarAnalysis>();
+  if (failed(solver.initializeAndRunPendingAnalyses(func)))
+    return signalPassFailure();
+
+  if (stats.initializeCount != 1) {
+    func.emitError("expected FooAnalysis to be initialized exactly once");
+    return signalPassFailure();
+  }
+
+  func.walk([&](Operation *op) {
+    if (!op->hasAttr(kTagAttrName))
+      return;
+
+    ProgramPoint *point = solver.getProgramPointAfter(op);
+    const FooState *fooState = solver.lookupState<FooState>(point);
+    const BarState *barState = solver.lookupState<BarState>(point);
+    assert(fooState && !fooState->isUninitialized());
+    assert(barState && !barState->isUninitialized());
+
+    op->setAttr(kFooStateAttrName,
+                builder.getI64IntegerAttr(fooState->getValue()));
+    op->setAttr(kBarStateAttrName,
+                builder.getI64IntegerAttr(barState->getValue()));
+  });
+}
+
 namespace mlir {
 namespace test {
 void registerTestFooAnalysisPass() { PassRegistration<TestFooAnalysisPass>(); }
+void registerTestStagedAnalysesPass() {
+  PassRegistration<TestStagedAnalysesPass>();
+}
 } // namespace test
 } // namespace mlir

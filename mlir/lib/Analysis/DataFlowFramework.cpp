@@ -110,6 +110,32 @@ Location LatticeAnchor::getLoc() const {
 //===----------------------------------------------------------------------===//
 
 LogicalResult DataFlowSolver::initializeAndRun(Operation *top) {
+  if (initializedAnalysisCount != 0) {
+    return top->emitError("dataflow solver has already been initialized; call "
+                          "'eraseAllStates()' to restart or "
+                          "'initializeAndRunPendingAnalyses()' to run newly "
+                          "loaded analyses");
+  }
+  return initializeAndRunImpl(top, /*firstAnalysis=*/0);
+}
+
+LogicalResult DataFlowSolver::initializeAndRunPendingAnalyses(Operation *top) {
+  if (initializedEquivalentAnalysisCount != initializedAnalysisCount) {
+    return top->emitError("dataflow solver is in a partially initialized "
+                          "state after a previous failure; call "
+                          "'eraseAllStates()' before reusing it");
+  }
+  if (analysisRoot && analysisRoot != top) {
+    return top->emitError("dataflow solver can only be resumed with the same "
+                          "top-level operation used for the original run");
+  }
+  return initializeAndRunImpl(top, initializedAnalysisCount);
+}
+
+LogicalResult DataFlowSolver::initializeAndRunImpl(Operation *top,
+                                                   size_t firstAnalysis) {
+  analysisRoot = top;
+
   // Enable enqueue to the worklist.
   isRunning = true;
   llvm::scope_exit guard([&]() { isRunning = false; });
@@ -121,17 +147,25 @@ LogicalResult DataFlowSolver::initializeAndRun(Operation *top) {
     config.setInterprocedural(false);
 
   // Initialize equivalent lattice anchors.
-  for (DataFlowAnalysis &analysis : llvm::make_pointee_range(childAnalyses)) {
+  for (size_t i = firstAnalysis, e = childAnalyses.size(); i != e; ++i) {
+    DataFlowAnalysis &analysis = *childAnalyses[i];
     analysis.initializeEquivalentLatticeAnchor(top);
+    ++initializedEquivalentAnalysisCount;
   }
 
   // Initialize the analyses.
-  for (DataFlowAnalysis &analysis : llvm::make_pointee_range(childAnalyses)) {
+  for (size_t i = firstAnalysis, e = childAnalyses.size(); i != e; ++i) {
+    DataFlowAnalysis &analysis = *childAnalyses[i];
     DATAFLOW_DEBUG(LDBG() << "Priming analysis: " << analysis.debugName);
     if (failed(analysis.initialize(top)))
       return failure();
+    ++initializedAnalysisCount;
   }
 
+  return runToFixpoint();
+}
+
+LogicalResult DataFlowSolver::runToFixpoint() {
   // Run the analysis until fixpoint.
   // Iterate until all states are in some initialized state and the worklist
   // is exhausted.
