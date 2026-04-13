@@ -794,6 +794,11 @@ bool DataFlowSolver::isEquivalent(LatticeAnchor lhs, LatticeAnchor rhs) const {
 
 template <typename StateT, typename AnchorT>
 void DataFlowSolver::unionLatticeAnchors(AnchorT anchor, AnchorT other) {
+  // States are stored on equivalence-class leaders, so canonicalize before
+  // checking for materialized states. For example, if `B` is already
+  // equivalent to leader `A` and `A` owns the state, a later union(B, C) must
+  // observe `A`'s state. Returning early keeps redundant unions like
+  // union(A, B) as harmless no-ops.
   LatticeAnchor lhs = getLeaderAnchorOrSelf<StateT>(LatticeAnchor(anchor));
   LatticeAnchor rhs = getLeaderAnchorOrSelf<StateT>(LatticeAnchor(other));
   if (lhs == rhs)
