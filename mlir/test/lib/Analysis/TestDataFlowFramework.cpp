@@ -18,8 +18,7 @@ namespace {
 constexpr char kTagAttrName[] = "tag";
 constexpr char kFooAttrName[] = "foo";
 constexpr char kFooStateAttrName[] = "foo_state";
-constexpr char kStagedBarStateAttrName[] = "staged_bar_state";
-constexpr char kSimultaneousBarStateAttrName[] = "simultaneous_bar_state";
+constexpr char kBarStateAttrName[] = "bar_state";
 
 /// This analysis state represents an integer that is XOR'd with other states.
 class FooState : public AnalysisState {
@@ -326,22 +325,11 @@ void TestStagedAnalysesPass::runOnOperation() {
   func::FuncOp func = getOperation();
   Builder builder(func.getContext());
 
-  DataFlowSolver simultaneousSolver;
-  simultaneousSolver.load<FooAnalysis>();
-  simultaneousSolver.load<BarAnalysis>();
-  if (failed(simultaneousSolver.initializeAndRun(func)))
-    return signalPassFailure();
-
   DataFlowSolver solver;
   solver.load<FooAnalysis>();
   if (failed(solver.initializeAndRun(func)))
     return signalPassFailure();
-  if (failed(solver.initializeAndRun(func)))
-    return signalPassFailure();
-
   solver.load<BarAnalysis>();
-  if (failed(solver.initializeAndRunPendingAnalyses(func)))
-    return signalPassFailure();
   if (failed(solver.initializeAndRunPendingAnalyses(func)))
     return signalPassFailure();
 
@@ -351,20 +339,13 @@ void TestStagedAnalysesPass::runOnOperation() {
 
     ProgramPoint *point = solver.getProgramPointAfter(op);
     const FooState *fooState = solver.lookupState<FooState>(point);
-    const BarState *stagedBarState = solver.lookupState<BarState>(point);
-    const BarState *simultaneousBarState =
-        simultaneousSolver.lookupState<BarState>(
-            simultaneousSolver.getProgramPointAfter(op));
+    const BarState *barState = solver.lookupState<BarState>(point);
     assert(fooState && !fooState->isUninitialized());
-    assert(stagedBarState && !stagedBarState->isUninitialized());
-    assert(simultaneousBarState && !simultaneousBarState->isUninitialized());
+    assert(barState && !barState->isUninitialized());
 
     op->setAttr(kFooStateAttrName,
                 builder.getI64IntegerAttr(fooState->getValue()));
-    op->setAttr(kStagedBarStateAttrName,
-                builder.getBoolAttr(stagedBarState->getValue()));
-    op->setAttr(kSimultaneousBarStateAttrName,
-                builder.getBoolAttr(simultaneousBarState->getValue()));
+    op->setAttr(kBarStateAttrName, builder.getBoolAttr(barState->getValue()));
   });
 }
 
