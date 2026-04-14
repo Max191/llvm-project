@@ -76,6 +76,10 @@ struct FooAnalysisStats {
   unsigned initializeCount = 0;
 };
 
+struct BarAnalysisStats {
+  unsigned initializeCount = 0;
+};
+
 /// This analysis computes `FooState` across operations and control-flow edges.
 /// If an op specifies a `foo` integer attribute, the contained value is XOR'd
 /// with the value before the operation.
@@ -133,7 +137,9 @@ class BarAnalysis : public DataFlowAnalysis {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(BarAnalysis)
 
-  using DataFlowAnalysis::DataFlowAnalysis;
+  explicit BarAnalysis(DataFlowSolver &solver,
+                       BarAnalysisStats *stats = nullptr)
+      : DataFlowAnalysis(solver), stats(stats) {}
 
   LogicalResult initialize(Operation *top) override;
   LogicalResult visit(ProgramPoint *point) override;
@@ -142,6 +148,8 @@ private:
   void visitBlock(Block *block);
   void visitOperation(Operation *op);
   void visitPoint(ProgramPoint *point, uint64_t offset);
+
+  BarAnalysisStats *stats;
 };
 
 struct TestFooAnalysisPass
@@ -233,6 +241,9 @@ void FooAnalysis::visitOperation(Operation *op) {
 }
 
 LogicalResult BarAnalysis::initialize(Operation *top) {
+  if (stats)
+    ++stats->initializeCount;
+
   if (top->getNumRegions() != 1)
     return top->emitError("expected a single region top-level op");
 
@@ -316,12 +327,21 @@ void TestStagedAnalysesPass::runOnOperation() {
     return signalPassFailure();
   }
 
-  solver.load<BarAnalysis>();
+  BarAnalysisStats barStats;
+  solver.load<BarAnalysis>(&barStats);
   if (failed(solver.initializeAndRunPendingAnalyses(func)))
     return signalPassFailure();
-  if (stats.initializeCount != 2) {
+  if (stats.initializeCount != 2 || barStats.initializeCount != 1) {
     func.emitError("expected pending analyses to preserve converged "
-                   "FooAnalysis results without reinitializing FooAnalysis");
+                   "FooAnalysis results without reinitializing FooAnalysis, "
+                   "while initializing BarAnalysis exactly once");
+    return signalPassFailure();
+  }
+  if (failed(solver.initializeAndRunPendingAnalyses(func)))
+    return signalPassFailure();
+  if (stats.initializeCount != 2 || barStats.initializeCount != 1) {
+    func.emitError("expected rerunning pending analyses with no newly loaded "
+                   "analyses to be a no-op");
     return signalPassFailure();
   }
 
