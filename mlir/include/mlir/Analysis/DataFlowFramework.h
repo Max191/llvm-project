@@ -370,8 +370,7 @@ public:
     initializedAnalysisCount = 0;
     analysisRoot = nullptr;
     hasFailedRun = false;
-    decltype(worklist) emptyWorklist;
-    worklist.swap(emptyWorklist);
+    worklist = std::queue<std::pair<ProgramPoint *, DataFlowAnalysis *>>();
   }
 
   /// Get a uniqued lattice anchor instance. If one is not present, it is
