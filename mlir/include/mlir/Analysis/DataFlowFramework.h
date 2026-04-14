@@ -370,8 +370,8 @@ public:
     initializedAnalysisCount = 0;
     analysisRoot = nullptr;
     hasFailedRun = false;
-    while (!worklist.empty())
-      worklist.pop();
+    decltype(worklist) emptyWorklist;
+    worklist.swap(emptyWorklist);
   }
 
   /// Get a uniqued lattice anchor instance. If one is not present, it is
