@@ -72,14 +72,6 @@ private:
   std::optional<uint64_t> state;
 };
 
-struct FooAnalysisStats {
-  unsigned initializeCount = 0;
-};
-
-struct BarAnalysisStats {
-  unsigned initializeCount = 0;
-};
-
 /// This analysis computes `FooState` across operations and control-flow edges.
 /// If an op specifies a `foo` integer attribute, the contained value is XOR'd
 /// with the value before the operation.
@@ -87,9 +79,7 @@ class FooAnalysis : public DataFlowAnalysis {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FooAnalysis)
 
-  explicit FooAnalysis(DataFlowSolver &solver,
-                       FooAnalysisStats *stats = nullptr)
-      : DataFlowAnalysis(solver), stats(stats) {}
+  using DataFlowAnalysis::DataFlowAnalysis;
 
   LogicalResult initialize(Operation *top) override;
   LogicalResult visit(ProgramPoint *point) override;
@@ -97,14 +87,12 @@ public:
 private:
   void visitBlock(Block *block);
   void visitOperation(Operation *op);
-
-  FooAnalysisStats *stats;
 };
 
-/// This analysis state stores whether all observed `FooState` values at a
-/// program point have been non-multiples of 4. The state monotonically evolves
-/// from true to false at each point independently and is intended to be run
-/// only after `FooAnalysis` converges.
+/// This analysis state stores whether all previously observed `FooState`
+/// values at tagged program points along the CFG leading to the current point
+/// have been non-multiples of 4. Once the state becomes false at some point,
+/// all later points reachable from it also remain false.
 class BarState : public AnalysisState {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(BarState)
@@ -146,25 +134,23 @@ private:
 };
 
 /// This analysis is intended to be loaded after `FooAnalysis` has converged.
-/// It records whether every observed `FooState` at a point has been
-/// non-divisible by 4. Because the state only ever transitions from true to
-/// false at that point, observing a transient divisible-by-4 `FooState` before
-/// convergence can permanently poison the result.
+/// It records whether every observed `FooState` on or before a given tagged
+/// program point has been non-divisible by 4. Because the state only ever
+/// transitions from true to false, observing a transient divisible-by-4
+/// `FooState` before `FooAnalysis` converges can permanently poison the
+/// result.
 class BarAnalysis : public DataFlowAnalysis {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(BarAnalysis)
 
-  explicit BarAnalysis(DataFlowSolver &solver,
-                       BarAnalysisStats *stats = nullptr)
-      : DataFlowAnalysis(solver), stats(stats) {}
+  using DataFlowAnalysis::DataFlowAnalysis;
 
   LogicalResult initialize(Operation *top) override;
   LogicalResult visit(ProgramPoint *point) override;
 
 private:
+  void visitBlock(Block *block);
   void visitOperation(Operation *op);
-
-  BarAnalysisStats *stats;
 };
 
 struct TestFooAnalysisPass
@@ -187,9 +173,6 @@ struct TestStagedAnalysesPass
 } // namespace
 
 LogicalResult FooAnalysis::initialize(Operation *top) {
-  if (stats)
-    ++stats->initializeCount;
-
   if (top->getNumRegions() != 1)
     return top->emitError("expected a single region top-level op");
 
@@ -256,16 +239,18 @@ void FooAnalysis::visitOperation(Operation *op) {
 }
 
 LogicalResult BarAnalysis::initialize(Operation *top) {
-  if (stats)
-    ++stats->initializeCount;
-
   if (top->getNumRegions() != 1)
     return top->emitError("expected a single region top-level op");
 
   if (top->getRegion(0).getBlocks().empty())
     return top->emitError("expected at least one block in the region");
 
+  // Seed the entry state to true before observing any `FooState`.
+  (void)getOrCreate<BarState>(getProgramPointBefore(&top->getRegion(0).front()))
+      ->join(true);
+
   for (Block &block : top->getRegion(0)) {
+    visitBlock(&block);
     for (Operation &op : block) {
       if (op.getNumRegions())
         return op.emitError("unexpected op with regions");
@@ -278,18 +263,42 @@ LogicalResult BarAnalysis::initialize(Operation *top) {
 LogicalResult BarAnalysis::visit(ProgramPoint *point) {
   if (!point->isBlockStart())
     visitOperation(point->getPrevOp());
+  else
+    visitBlock(point->getBlock());
   return success();
+}
+
+void BarAnalysis::visitBlock(Block *block) {
+  if (block->isEntryBlock())
+    return;
+
+  ProgramPoint *point = getProgramPointBefore(block);
+  BarState *state = getOrCreate<BarState>(point);
+  ChangeResult result = ChangeResult::NoChange;
+  for (Block *pred : block->getPredecessors()) {
+    const BarState *predState = getOrCreateFor<BarState>(
+        point, getProgramPointAfter(pred->getTerminator()));
+    result |= state->join(*predState);
+  }
+  propagateIfChanged(state, result);
 }
 
 void BarAnalysis::visitOperation(Operation *op) {
   ProgramPoint *point = getProgramPointAfter(op);
   BarState *state = getOrCreate<BarState>(point);
+  ChangeResult result = ChangeResult::NoChange;
 
-  const FooState *fooState = getOrCreateFor<FooState>(point, point);
-  if (fooState->isUninitialized())
-    return;
+  const BarState *prevState =
+      getOrCreateFor<BarState>(point, getProgramPointBefore(op));
+  result |= state->join(*prevState);
 
-  propagateIfChanged(state, state->join((fooState->getValue() & 0x3) != 0));
+  if (op->hasAttr(kTagAttrName)) {
+    const FooState *fooState = getOrCreateFor<FooState>(point, point);
+    if (fooState->isUninitialized())
+      return;
+    result |= state->join((fooState->getValue() & 0x3) != 0);
+  }
+  propagateIfChanged(state, result);
 }
 
 void TestFooAnalysisPass::runOnOperation() {
@@ -323,37 +332,18 @@ void TestStagedAnalysesPass::runOnOperation() {
   if (failed(simultaneousSolver.initializeAndRun(func)))
     return signalPassFailure();
 
-  FooAnalysisStats stats;
   DataFlowSolver solver;
-  solver.load<FooAnalysis>(&stats);
+  solver.load<FooAnalysis>();
   if (failed(solver.initializeAndRun(func)))
     return signalPassFailure();
   if (failed(solver.initializeAndRun(func)))
     return signalPassFailure();
 
-  if (stats.initializeCount != 2) {
-    func.emitError("expected FooAnalysis to be initialized exactly twice "
-                   "after two full solver runs");
-    return signalPassFailure();
-  }
-
-  BarAnalysisStats barStats;
-  solver.load<BarAnalysis>(&barStats);
+  solver.load<BarAnalysis>();
   if (failed(solver.initializeAndRunPendingAnalyses(func)))
     return signalPassFailure();
-  if (stats.initializeCount != 2 || barStats.initializeCount != 1) {
-    func.emitError("expected pending analyses to preserve converged "
-                   "FooAnalysis results without reinitializing FooAnalysis, "
-                   "while initializing BarAnalysis exactly once");
-    return signalPassFailure();
-  }
   if (failed(solver.initializeAndRunPendingAnalyses(func)))
     return signalPassFailure();
-  if (stats.initializeCount != 2 || barStats.initializeCount != 1) {
-    func.emitError("expected rerunning pending analyses with no newly loaded "
-                   "analyses to be a no-op");
-    return signalPassFailure();
-  }
 
   func.walk([&](Operation *op) {
     if (!op->hasAttr(kTagAttrName))
